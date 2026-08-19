@@ -6,4 +6,6 @@ until [[ -s /run/bowxt/session.env ]]; do sleep 0.2; done
 source /run/bowxt/session.env
 export BOWXT_DB=${BOWXT_DB:-/home/wechat/.local/share/bowxt/messages.db}
 exec /opt/bowxt-venv/bin/bowxt serve --host 0.0.0.0 --port 8787 \
-  --db "$BOWXT_DB" --poll-gap "${BOWXT_POLL_GAP:-2.0}"
+  --db "$BOWXT_DB" --poll-gap "${BOWXT_POLL_GAP:-1.5}" \
+  --action-delay "${BOWXT_ACTION_DELAY:-0.12}" \
+  --sync-mode "${BOWXT_SYNC_MODE:-polling}"

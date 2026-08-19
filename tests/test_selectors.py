@@ -7,6 +7,7 @@ from bowxt.selectors import (
     find_message_list,
     find_profile_name,
     find_search_box,
+    visible_message_nodes,
 )
 
 from fakes import FakeNode, sample_tree
@@ -65,3 +66,33 @@ class SelectorTests(unittest.TestCase):
             ],
         )
         self.assertEqual(find_profile_name(profile), "张三")
+
+    def test_linux_chinese_profile_action_names_are_verified(self):
+        profile = FakeNode(
+            "filler",
+            bounds=Rect(435, 417, 328, 446),
+            token="linux-profile",
+            nodes=[
+                FakeNode("button", "黄泽文", bounds=Rect(483, 465, 60, 60)),
+                FakeNode("label", "黄泽文", bounds=Rect(559, 465, 69, 26)),
+                FakeNode("button", "添加备注名", bounds=Rect(559, 530, 100, 26)),
+                FakeNode("button", "发消息", bounds=Rect(483, 756, 72, 59)),
+                FakeNode("button", "语音聊天", bounds=Rect(566, 756, 72, 59)),
+                FakeNode("button", "视频聊天", bounds=Rect(649, 756, 72, 59)),
+            ],
+        )
+
+        self.assertEqual(find_profile_name(profile), "黄泽文")
+
+    def test_virtual_rows_outside_message_viewport_are_ignored(self):
+        visible = FakeNode("list item", "当前消息", bounds=Rect(100, 120, 400, 50))
+        stale = FakeNode("list item", "陈旧消息", bounds=Rect(100, -500, 400, 50))
+        one_pixel = FakeNode("list item", "边界残留", bounds=Rect(100, 21, 400, 80))
+        offscreen = FakeNode(
+            "list item", "离屏消息", bounds=Rect(100, 180, 400, 50), states={"offscreen"}
+        )
+        message_list = FakeNode(
+            "list", "Messages", bounds=Rect(100, 100, 500, 400),
+            nodes=[stale, one_pixel, visible, offscreen],
+        )
+        self.assertEqual(visible_message_nodes(message_list), [visible])

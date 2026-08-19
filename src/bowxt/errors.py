@@ -24,3 +24,7 @@ class MentionSelectionError(BowxtError):
 
 class SafetyLimitExceeded(BowxtError):
     """A configured anti-abuse safety limit rejected an operation."""
+
+
+class ServicePaused(BowxtError):
+    """The UI worker is paused and must not read from or write to WeChat."""

@@ -52,6 +52,17 @@ class Rect:
 
 
 @dataclass(frozen=True, slots=True)
+class MessageImage:
+    """Pixels read from a visible WeChat image bubble without OCR."""
+
+    data: bytes = field(repr=False, compare=False, hash=False)
+    mime_type: str = "image/png"
+    width: int | None = None
+    height: int | None = None
+    source: str = "window_pixels"
+
+
+@dataclass(frozen=True, slots=True)
 class Message:
     """A best-effort structured view of one visible WeChat message."""
 
@@ -65,6 +76,7 @@ class Message:
     chat_type: ChatType = ChatType.UNKNOWN
     is_at_me: bool = False
     bounds: Rect | None = None
+    image: MessageImage | None = field(default=None, compare=False, hash=False)
     raw: Mapping[str, Any] = field(default_factory=dict, compare=False, hash=False)
 
 
@@ -76,3 +88,4 @@ class SendReceipt:
     verified: bool
     matched_message_id: str | None = None
     mentions: tuple[str, ...] = ()
+    timings: Mapping[str, float] = field(default_factory=dict, compare=False)

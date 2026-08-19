@@ -188,8 +188,9 @@ def is_profile_card(window: Node) -> bool:
 
     markers = {
         "remark", "备注", "messages", "发消息", "voice call", "语音通话",
-        "video call", "视频通话", "enterprise information", "企业信息",
-        "add alias", "添加备注",
+        "语音聊天", "video call", "视频通话", "视频聊天",
+        "enterprise information", "企业信息", "add alias", "添加备注",
+        "添加备注名",
     }
     found: set[str] = set()
     for node, _depth in walk(window, max_depth=12):
@@ -233,7 +234,24 @@ def find_profile_name(profile_window: Node) -> str | None:
 
 def visible_message_nodes(message_list: Node) -> list[Node]:
     result: list[Node] = []
+    viewport = message_list.bounds
     for child in message_list.children():
+        states = child.states
+        if states.intersection({"defunct", "invisible", "offscreen"}):
+            continue
+        bounds = child.bounds
+        if viewport is not None:
+            if bounds is None:
+                continue
+            visible_width = min(bounds.right, viewport.right) - max(bounds.x, viewport.x)
+            visible_height = min(bounds.bottom, viewport.bottom) - max(bounds.y, viewport.y)
+            # Qt keeps a transient row just above the viewport and may report
+            # it as showing even when only its final pixel intersects the
+            # message list. Treating that sliver as a message creates a local
+            # phantom copy without a time or direction.
+            min_visible_height = min(bounds.height, max(4, min(12, bounds.height // 4)))
+            if visible_width <= 0 or visible_height < min_visible_height:
+                continue
         if _message_likeness(child) >= 15:
             result.append(child)
     return result

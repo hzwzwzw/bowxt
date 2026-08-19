@@ -4,12 +4,21 @@ import os
 import queue
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Callable, Iterable
 
 from .client import WeChatClient
-from .models import ChatType
-from .store import SQLiteStore, StoredChat, StoredMessage
+from .errors import ServicePaused
+from .models import ChatType, Direction, MessageType
+from .store import AgentDelivery, AgentLog, SQLiteStore, StoredChat, StoredMessage
+
+
+class SyncMode(str, Enum):
+    POLLING = "polling"
+    UNREAD = "unread"
+    PAUSED = "paused"
 
 
 class EventBroker:
@@ -46,9 +55,23 @@ class _SendCommand:
     chat_id: int
     text: str
     mentions: tuple[str, ...]
+    pending_seq: int
+    queued_at: float = field(default_factory=time.monotonic)
     completed: threading.Event = field(default_factory=threading.Event)
     result: StoredMessage | None = None
     error: BaseException | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _SenderJob:
+    chat_id: int
+    message_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ImageJob:
+    chat_id: int
+    message_id: str
 
 
 class BowxtService:
@@ -64,34 +87,59 @@ class BowxtService:
         store: SQLiteStore,
         *,
         client_factory: Callable[[], WeChatClient] | None = None,
-        poll_gap: float = 2.0,
-        discovery_interval: float = 8.0,
+        poll_gap: float = 1.5,
+        discovery_interval: float = 4.0,
+        action_delay: float = 0.12,
+        sync_mode: SyncMode | str = SyncMode.POLLING,
     ):
         if poll_gap < 1.5:
             raise ValueError("poll_gap below 1.5s is intentionally rejected")
         self.store = store
         self.poll_gap = float(poll_gap)
+        if not 0.06 <= float(action_delay) <= 0.5:
+            raise ValueError("action_delay must be between 0.06 and 0.5 seconds")
+        self.action_delay = float(action_delay)
         self.discovery_interval = max(float(discovery_interval), 4.0)
+        self._mode = SyncMode(sync_mode)
+        self._resume_mode = (
+            self._mode if self._mode is not SyncMode.PAUSED else SyncMode.POLLING
+        )
         self.events = EventBroker()
         self._client_factory = client_factory or self._default_client
         self._commands: queue.Queue[_SendCommand] = queue.Queue(maxsize=128)
+        self._sender_jobs: deque[_SenderJob] = deque()
+        self._sender_job_keys: set[tuple[int, str]] = set()
+        self._image_jobs: deque[_ImageJob] = deque()
+        self._image_job_keys: set[tuple[int, str]] = set()
         self._stop = threading.Event()
+        self._paused = threading.Event()
+        if self._mode is SyncMode.PAUSED:
+            self._paused.set()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
+        self._sender_event_seqs: set[int] = set()
         self._status_lock = threading.Lock()
         self._status: dict[str, Any] = {
             "running": False,
             "wechat_connected": False,
             "last_error": None,
             "active_chat": None,
+            "last_send_timings": None,
         }
 
-    @staticmethod
-    def _default_client() -> WeChatClient:
-        return WeChatClient(
-            visual_direction=True,
-            uia_sender=os.environ.get("BOWXT_UIA_SENDER", "0") == "1",
+    def _default_client(self) -> WeChatClient:
+        my_names = tuple(
+            value.strip()
+            for value in os.environ.get("BOWXT_MY_NAMES", "").split(",")
+            if value.strip()
         )
+        client = WeChatClient(
+            visual_direction=True,
+            uia_sender=os.environ.get("BOWXT_UIA_SENDER", "1") == "1",
+            my_names=my_names,
+        )
+        client.set_operation_delay(self.action_delay)
+        return client
 
     @property
     def is_running(self) -> bool:
@@ -116,7 +164,57 @@ class BowxtService:
             value = dict(self._status)
         value["running"] = bool(value.get("running") and self.is_running)
         value["chat_count"] = len(self.store.list_chats(enabled_only=True))
+        value["paused"] = self._paused.is_set()
+        value["mode"] = self._mode.value
+        value["poll_gap"] = self.poll_gap
+        value["action_delay"] = self.action_delay
+        value["queue_depth"] = self._commands.qsize()
+        value["sender_queue_depth"] = len(self._sender_jobs)
+        value["image_queue_depth"] = len(self._image_jobs)
         return value
+
+    def configure(
+        self,
+        *,
+        paused: bool | None = None,
+        mode: SyncMode | str | None = None,
+        poll_gap: float | None = None,
+        action_delay: float | None = None,
+    ) -> dict[str, Any]:
+        if paused is not None and mode is not None:
+            raise ValueError("configure accepts either mode or paused, not both")
+        if poll_gap is not None:
+            value = float(poll_gap)
+            if not 1.5 <= value <= 30.0:
+                raise ValueError("poll_gap must be between 1.5 and 30 seconds")
+            self.poll_gap = value
+        if action_delay is not None:
+            value = float(action_delay)
+            if not 0.06 <= value <= 0.5:
+                raise ValueError("action_delay must be between 0.06 and 0.5 seconds")
+            self.action_delay = value
+        if mode is not None:
+            selected = SyncMode(mode)
+            self._mode = selected
+            if selected is SyncMode.PAUSED:
+                self._paused.set()
+            else:
+                self._resume_mode = selected
+                self._paused.clear()
+        elif paused is not None:
+            if not isinstance(paused, bool):
+                raise ValueError("paused must be a boolean")
+            if paused:
+                if self._mode is not SyncMode.PAUSED:
+                    self._resume_mode = self._mode
+                self._mode = SyncMode.PAUSED
+                self._paused.set()
+            else:
+                self._mode = self._resume_mode
+                self._paused.clear()
+        self._wake.set()
+        self.events.publish({"type": "status", "status": self.status()})
+        return self.status()
 
     def add_chat(
         self,
@@ -138,6 +236,96 @@ class BowxtService:
         self._wake.set()
         return chat
 
+    def claim_agent_messages(
+        self,
+        consumer: str,
+        *,
+        chat_ids: Iterable[int] = (),
+        limit: int = 8,
+        lease_seconds: float = 60.0,
+        timeout: float = 0.0,
+        require_sender: bool = False,
+        require_at_me: bool = False,
+        replay_existing: bool = False,
+    ) -> list[AgentDelivery]:
+        """Long-poll the durable incoming-message stream for an Agent.
+
+        The store lease is the source of truth; the in-memory broker is used
+        only as a wake-up hint, so reconnects and process restarts do not lose
+        messages.
+        """
+
+        if self._paused.is_set():
+            raise ServicePaused("bowxt UI worker is paused")
+        wait_seconds = min(max(float(timeout), 0.0), 25.0)
+        deadline = time.monotonic() + wait_seconds
+        subscriber = self.events.subscribe() if wait_seconds else None
+        try:
+            while True:
+                if self._paused.is_set():
+                    raise ServicePaused("bowxt UI worker is paused")
+                deliveries = self.store.claim_agent_messages(
+                    consumer,
+                    chat_ids=chat_ids,
+                    limit=limit,
+                    lease_seconds=lease_seconds,
+                    require_sender=require_sender,
+                    require_at_me=require_at_me,
+                    replay_existing=replay_existing,
+                )
+                if deliveries or subscriber is None:
+                    return deliveries
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return []
+                try:
+                    subscriber.get(timeout=remaining)
+                except queue.Empty:
+                    return []
+        finally:
+            if subscriber is not None:
+                self.events.unsubscribe(subscriber)
+
+    def ack_agent_message(self, consumer: str, message_seq: int, lease_token: str) -> None:
+        self.store.ack_agent_message(consumer, message_seq, lease_token)
+
+    def nack_agent_message(
+        self,
+        consumer: str,
+        message_seq: int,
+        lease_token: str,
+        *,
+        error: str = "",
+        retry_delay: float = 5.0,
+    ) -> None:
+        self.store.nack_agent_message(
+            consumer,
+            message_seq,
+            lease_token,
+            error=error,
+            retry_delay=retry_delay,
+        )
+        self.events.publish({"type": "agent_delivery_retry", "consumer": consumer})
+
+    def log_agent(
+        self,
+        agent: str,
+        level: str,
+        message: str,
+        *,
+        event: str = "log",
+        context: dict[str, Any] | None = None,
+    ) -> AgentLog:
+        value = self.store.append_agent_log(
+            agent,
+            level,
+            message,
+            event=event,
+            context=context,
+        )
+        self.events.publish({"type": "agent_log", "log": value.as_dict()})
+        return value
+
     def send_text(
         self,
         chat_id: int,
@@ -146,19 +334,64 @@ class BowxtService:
         mentions: Iterable[str] = (),
         timeout: float = 30.0,
     ) -> StoredMessage:
-        if not self.is_running:
-            raise RuntimeError("bowxt UI worker is not running")
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("text must not be empty")
-        command = _SendCommand(int(chat_id), text, tuple(mentions))
-        self._commands.put(command, timeout=min(timeout, 5.0))
-        self._wake.set()
+        _pending, command = self._enqueue_text(chat_id, text, mentions=mentions)
+        assert command is not None
         if not command.completed.wait(timeout):
             raise TimeoutError("timed out waiting for the WeChat UI worker")
         if command.error:
             raise command.error
         assert command.result is not None
         return command.result
+
+    def enqueue_text(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        mentions: Iterable[str] = (),
+        client_id: str | None = None,
+    ) -> StoredMessage:
+        """Persist and queue a send without waiting for visible UI confirmation."""
+
+        pending, _command = self._enqueue_text(
+            chat_id,
+            text,
+            mentions=mentions,
+            client_id=client_id,
+        )
+        return pending
+
+    def _enqueue_text(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        mentions: Iterable[str] = (),
+        client_id: str | None = None,
+    ) -> tuple[StoredMessage, _SendCommand | None]:
+        if not self.is_running:
+            raise RuntimeError("bowxt UI worker is not running")
+        if self._paused.is_set():
+            raise ServicePaused("bowxt UI worker is paused")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("text must not be empty")
+        mention_names = tuple(mentions)
+        pending, created = self.store.queue_send(
+            int(chat_id), text, client_id=client_id, mentions=mention_names
+        )
+        if not created:
+            return pending, None
+        command = _SendCommand(int(chat_id), text, mention_names, pending.seq)
+        try:
+            self._commands.put_nowait(command)
+        except queue.Full as exc:
+            failed = self.store.fail_pending_send(pending.seq, "send queue is full")
+            self.events.publish({"type": "message", "message": failed.as_dict()})
+            raise RuntimeError("send queue is full") from exc
+        self.events.publish({"type": "message", "message": pending.as_dict()})
+        self._wake.set()
+        self.events.publish({"type": "status", "status": self.status()})
+        return pending, command
 
     def _set_status(self, **changes: Any) -> None:
         with self._status_lock:
@@ -170,9 +403,32 @@ class BowxtService:
         next_poll = 0.0
         next_discovery = 0.0
         cursor = 0
+        applied_action_delay: float | None = None
+        applied_mode: SyncMode | None = None
         self._set_status(running=True)
         try:
             while not self._stop.is_set():
+                if self._paused.is_set():
+                    self._wake.wait(0.5)
+                    self._wake.clear()
+                    continue
+                if client is not None and getattr(client, "is_input_blocked", False):
+                    # The failed operation stays failed and is never replayed.
+                    # Discard only the locked in-memory session so a later
+                    # iteration can reconnect after the visible surface is
+                    # clean. If a transient still exists, the fresh client
+                    # will fail closed again on its next UI operation.
+                    client.disconnect()
+                    client = None
+                    applied_action_delay = None
+                    applied_mode = None
+                    self._set_status(
+                        wechat_connected=False,
+                        active_chat=None,
+                        last_error="resetting the UI session after a transient-window safety lock",
+                    )
+                    self._stop.wait(0.5)
+                    continue
                 if client is None:
                     try:
                         client = self._client_factory()
@@ -182,30 +438,69 @@ class BowxtService:
                         self._set_status(wechat_connected=True, last_error=None)
                     except Exception as exc:
                         client = None
+                        applied_action_delay = None
                         self._set_status(wechat_connected=False, last_error=str(exc))
                         self._stop.wait(2.0)
                         continue
 
+                if self._paused.is_set():
+                    continue
+                if applied_action_delay != self.action_delay:
+                    setter = getattr(client, "set_operation_delay", None)
+                    if setter is not None:
+                        setter(self.action_delay)
+                    applied_action_delay = self.action_delay
+                mode = self._mode
+                if applied_mode is not mode:
+                    next_poll = 0.0
+                    next_discovery = 0.0
+                    applied_mode = mode
                 command = self._next_command()
                 if command is not None:
                     self._execute_send(client, command)
-                    next_poll = time.monotonic() + self.poll_gap
+                    next_poll = time.monotonic()
+                    continue
+
+                image_job = self._next_image_job()
+                if image_job is not None:
+                    self._execute_image_job(client, image_job)
+                    next_poll = time.monotonic()
+                    continue
+
+                # Sender-card reads are background work. A newly queued send
+                # is always selected before the next card, so a burst of group
+                # messages cannot hold outgoing traffic behind the full burst.
+                sender_job = self._next_sender_job()
+                if sender_job is not None:
+                    self._execute_sender_job(client, sender_job)
+                    next_poll = time.monotonic()
                     continue
 
                 now = time.monotonic()
-                if now >= next_discovery:
+                if not self._paused.is_set() and now >= next_discovery:
                     try:
-                        for name in client.discover_unread_chats(limit=1):
-                            self.add_chat(name, ChatType.UNKNOWN, source="unread")
+                        processed_unread = self._drain_unread_chats(client)
+                        if mode is SyncMode.UNREAD and not processed_unread:
+                            self._poll_visible_chat(client)
                         self._set_status(last_error=None)
                     except Exception as exc:
                         self._set_status(last_error=f"discovery: {exc}")
-                    next_discovery = now + self.discovery_interval
+                    interval = (
+                        self.poll_gap
+                        if mode is SyncMode.UNREAD
+                        else self.discovery_interval
+                    )
+                    next_discovery = time.monotonic() + interval
 
                 # A stable ID order prevents new-message reordering in the UI
                 # from starving a quieter conversation.
                 chats = sorted(self.store.list_chats(enabled_only=True), key=lambda item: item.id)
-                if chats and now >= next_poll:
+                if (
+                    mode is SyncMode.POLLING
+                    and not self._paused.is_set()
+                    and chats
+                    and now >= next_poll
+                ):
                     chat = chats[cursor % len(chats)]
                     cursor = (cursor + 1) % max(len(chats), 1)
                     self._poll_chat(client, chat)
@@ -228,7 +523,117 @@ class BowxtService:
         except queue.Empty:
             return None
 
+    def _drain_unread_chats(self, client: WeChatClient, *, limit: int = 32) -> bool:
+        """Read every currently visible unread row in one wake cycle."""
+
+        names = client.discover_unread_chats(limit=limit)
+        processed = bool(names)
+        for name in dict.fromkeys(names):
+            discovered = self.add_chat(name, ChatType.UNKNOWN, source="unread")
+            self._poll_chat(client, discovered)
+        return processed
+
+    def _poll_visible_chat(self, client: WeChatClient) -> None:
+        """Read the already-open monitored chat without switching windows."""
+
+        reader = getattr(client, "visible_chat_name", None)
+        if reader is None:
+            return
+        name = reader()
+        if not name:
+            return
+        chat = next(
+            (item for item in self.store.list_chats(enabled_only=True) if item.name == name),
+            None,
+        )
+        if chat is not None:
+            self._poll_chat(client, chat)
+
+    def _queue_sender_job(self, chat_id: int, message_id: str) -> None:
+        key = (int(chat_id), str(message_id))
+        if key in self._sender_job_keys or len(self._sender_jobs) >= 512:
+            return
+        self._sender_jobs.append(_SenderJob(*key))
+        self._sender_job_keys.add(key)
+
+    def _queue_image_job(self, chat_id: int, message_id: str) -> None:
+        key = (int(chat_id), str(message_id))
+        if key in self._image_job_keys or len(self._image_jobs) >= 128:
+            return
+        self._image_jobs.append(_ImageJob(*key))
+        self._image_job_keys.add(key)
+
+    def _next_image_job(self) -> _ImageJob | None:
+        if not self._image_jobs:
+            return None
+        job = self._image_jobs.popleft()
+        self._image_job_keys.discard((job.chat_id, job.message_id))
+        return job
+
+    def _execute_image_job(self, client: WeChatClient, job: _ImageJob) -> None:
+        try:
+            chat = self.store.get_chat(job.chat_id)
+            self._set_status(active_chat=chat.name)
+            messages = client.get_visible_messages(
+                chat.name, chat_type=chat.chat_type, enrich_senders=False
+            )
+            target = next((item for item in messages if item.id == job.message_id), None)
+            if target is None:
+                return
+            upgraded = client.extract_visible_image(target, chat=chat.name)
+            stored, _created = self.store.save_message(upgraded)
+            self.events.publish({"type": "message", "message": stored.as_dict()})
+            self.store.set_chat_error(chat.id, None)
+            self._set_status(last_error=None)
+        except Exception as exc:
+            try:
+                self.store.set_chat_error(job.chat_id, str(exc))
+            except Exception:
+                pass
+            self._set_status(last_error=f"image extraction: {exc}")
+        finally:
+            self._set_status(active_chat=None)
+
+    def _next_sender_job(self) -> _SenderJob | None:
+        if not self._sender_jobs:
+            return None
+        job = self._sender_jobs.popleft()
+        self._sender_job_keys.discard((job.chat_id, job.message_id))
+        return job
+
+    def _execute_sender_job(self, client: WeChatClient, job: _SenderJob) -> None:
+        try:
+            chat = self.store.get_chat(job.chat_id)
+            self._set_status(active_chat=chat.name)
+            messages = client.get_visible_messages(
+                chat.name,
+                chat_type=chat.chat_type,
+                enrich_senders=False,
+            )
+            target = next((item for item in messages if item.id == job.message_id), None)
+            if target is None:
+                return
+            enriched = client.enrich_visible_senders([target], chat=chat.name)
+            if not enriched or enriched[0].sender is None:
+                return
+            stored, _created = self.store.save_message(enriched[0])
+            self.events.publish({"type": "message", "message": stored.as_dict()})
+            self._sender_event_seqs.add(stored.seq)
+            if len(self._sender_event_seqs) > 4096:
+                self._sender_event_seqs = set(sorted(self._sender_event_seqs)[-2048:])
+            self.store.set_chat_error(chat.id, None)
+            self._set_status(last_error=None)
+        except Exception as exc:
+            try:
+                self.store.set_chat_error(job.chat_id, str(exc))
+            except Exception:
+                pass
+            self._set_status(last_error=f"sender enrichment: {exc}")
+        finally:
+            self._set_status(active_chat=None)
+
     def _execute_send(self, client: WeChatClient, command: _SendCommand) -> None:
+        worker_started = time.monotonic()
         try:
             chat = self.store.get_chat(command.chat_id)
             self._set_status(active_chat=chat.name)
@@ -238,13 +643,24 @@ class BowxtService:
                 chat_type=chat.chat_type,
                 mentions=command.mentions,
             )
-            stored, _created = self.store.save_receipt(receipt, chat.chat_type)
+            timings = {
+                "queue_wait_s": max(0.0, worker_started - command.queued_at),
+                **{key: round(float(value), 3) for key, value in receipt.timings.items()},
+                "worker_total_s": round(time.monotonic() - worker_started, 3),
+                "end_to_end_s": round(time.monotonic() - command.queued_at, 3),
+            }
+            stored = self.store.complete_pending_send(command.pending_seq, receipt)
             command.result = stored
             self.events.publish({"type": "message", "message": stored.as_dict()})
             self.store.set_chat_error(chat.id, None)
-            self._set_status(last_error=None)
+            self._set_status(last_error=None, last_send_timings=timings)
         except BaseException as exc:
             command.error = exc
+            try:
+                failed = self.store.fail_pending_send(command.pending_seq, str(exc))
+                self.events.publish({"type": "message", "message": failed.as_dict()})
+            except Exception:
+                pass
             try:
                 self.store.set_chat_error(command.chat_id, str(exc))
             except Exception:
@@ -254,15 +670,68 @@ class BowxtService:
             self._set_status(active_chat=None)
             command.completed.set()
             self._commands.task_done()
+            self.events.publish({"type": "status", "status": self.status()})
 
     def _poll_chat(self, client: WeChatClient, chat: StoredChat) -> None:
         self._set_status(active_chat=chat.name)
         try:
-            messages = client.get_visible_messages(chat.name, chat_type=chat.chat_type)
+            uia_sender = bool(getattr(client, "uia_sender", False))
+            messages = client.get_visible_messages(
+                chat.name,
+                chat_type=chat.chat_type,
+                # Persist and publish the whole burst first. Profile cards are
+                # then opened only for newly created rows, so old viewport
+                # history cannot turn every poll into a long blocking scan.
+                enrich_senders=not uia_sender,
+            )
+            new_sender_candidates = []
+            image_candidates = []
+            backlog_candidate = None
             for message in messages:
                 stored, created = self.store.save_message(message)
-                if created:
+                sender_update = bool(
+                    message.sender is not None
+                    and stored.seq not in self._sender_event_seqs
+                )
+                if created or sender_update:
                     self.events.publish({"type": "message", "message": stored.as_dict()})
+                if message.sender is not None:
+                    self._sender_event_seqs.add(stored.seq)
+                    if len(self._sender_event_seqs) > 4096:
+                        self._sender_event_seqs = set(sorted(self._sender_event_seqs)[-2048:])
+                if (
+                    message.type is MessageType.IMAGE
+                    and stored.image_source != "viewer_clipboard"
+                    and isinstance(message.raw.get("image_bounds"), dict)
+                    and (
+                        message.bounds is None
+                        or int(message.raw["image_bounds"].get("width", 0))
+                        < message.bounds.width * 0.85
+                    )
+                ):
+                    image_candidates.append(message)
+                if (
+                    uia_sender
+                    and message.chat_type is ChatType.GROUP
+                    and message.direction is Direction.INCOMING
+                    and message.sender is None
+                    and stored.sender is None
+                ):
+                    if created:
+                        new_sender_candidates.append(message)
+                    elif backlog_candidate is None:
+                        backlog_candidate = message
+
+            # Queue every new row. The worker processes these jobs one at a
+            # time only when no send is waiting. When there is no new burst,
+            # use the otherwise-idle cycle to repair one historical row.
+            sender_candidates = new_sender_candidates
+            if not sender_candidates and backlog_candidate is not None:
+                sender_candidates = [backlog_candidate]
+            for message in sender_candidates:
+                self._queue_sender_job(chat.id, message.id)
+            for message in image_candidates:
+                self._queue_image_job(chat.id, message.id)
             self.store.set_chat_error(chat.id, None)
             self._set_status(last_error=None)
         except Exception as exc:

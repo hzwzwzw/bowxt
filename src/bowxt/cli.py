@@ -11,7 +11,7 @@ from .accessibility import AtspiBackend, format_tree
 from .client import WeChatClient
 from .models import ChatType
 from .selectors import DEFAULT_PROFILE, find_search_box
-from .service import BowxtService
+from .service import BowxtService, SyncMode
 from .store import SQLiteStore
 
 
@@ -101,7 +101,13 @@ def main(argv: list[str] | None = None) -> int:
         "--db",
         default=os.environ.get("BOWXT_DB", "/home/wechat/.local/share/bowxt/messages.db"),
     )
-    serve_parser.add_argument("--poll-gap", type=float, default=2.0)
+    serve_parser.add_argument("--poll-gap", type=float, default=1.5)
+    serve_parser.add_argument("--action-delay", type=float, default=0.12)
+    serve_parser.add_argument(
+        "--sync-mode",
+        choices=[item.value for item in SyncMode],
+        default=os.environ.get("BOWXT_SYNC_MODE", SyncMode.POLLING.value),
+    )
     args = parser.parse_args(argv)
 
     if args.command == "doctor":
@@ -136,7 +142,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve":
         from .web import serve
 
-        service = BowxtService(SQLiteStore(args.db), poll_gap=args.poll_gap)
+        service = BowxtService(
+            SQLiteStore(args.db),
+            poll_gap=args.poll_gap,
+            action_delay=args.action_delay,
+            sync_mode=args.sync_mode,
+        )
         serve(service, host=args.host, port=args.port)
         return 0
     return 2
@@ -153,6 +164,16 @@ def _json_message(message) -> dict:
         "direction": message.direction.value,
         "timestamp": message.timestamp.isoformat() if message.timestamp else None,
         "is_at_me": message.is_at_me,
+        "image": (
+            {
+                "mime_type": message.image.mime_type,
+                "width": message.image.width,
+                "height": message.image.height,
+                "source": message.image.source,
+                "bytes": len(message.image.data),
+            }
+            if message.image else None
+        ),
     }
 
 

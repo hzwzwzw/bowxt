@@ -1,5 +1,8 @@
 import unittest
+from io import BytesIO
 from unittest.mock import patch
+
+from PIL import Image
 
 from bowxt.input import X11Clipboard, X11Input
 from bowxt.models import Rect
@@ -38,6 +41,24 @@ class X11InputMappingTests(unittest.TestCase):
 
 
 class X11ClipboardTests(unittest.TestCase):
+    def test_clipboard_png_is_validated_with_original_dimensions(self):
+        output = BytesIO()
+        Image.new("RGB", (1200, 2670), "green").save(output, format="PNG")
+        clipboard = X11Clipboard.__new__(X11Clipboard)
+
+        with patch.object(X11Clipboard, "targets", return_value=("text/plain", "image/png")), \
+             patch.object(
+                 X11Clipboard,
+                 "read_bytes",
+                 side_effect=lambda mime: output.getvalue() if mime == "image/png" else None,
+             ):
+            image = clipboard.read_image()
+
+        self.assertIsNotNone(image)
+        self.assertEqual((image.width, image.height), (1200, 2670))
+        self.assertEqual(image.mime_type, "image/png")
+        self.assertEqual(image.source, "viewer_clipboard")
+
     @patch("bowxt.input.shutil.which", return_value="/usr/bin/xclip")
     @patch.dict("bowxt.input.os.environ", {"DISPLAY": ":1"}, clear=False)
     @patch("bowxt.input.subprocess.run")
