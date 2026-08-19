@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+config_home=${XDG_CONFIG_HOME:-${HOME:?}/.config}
+install -d -m 0700 "$config_home/fcitx5" "$config_home/environment.d"
+
+# Keep user customization on later starts. These files are only defaults for a
+# new persistent home volume.
+if [[ ! -e "$config_home/fcitx5/profile" ]]; then
+  install -m 0600 /usr/share/bowxt/fcitx5/profile "$config_home/fcitx5/profile"
+fi
+if [[ ! -e "$config_home/environment.d/90-bowxt-input-method.conf" ]]; then
+  install -m 0600 /usr/share/bowxt/fcitx5/im.conf \
+    "$config_home/environment.d/90-bowxt-input-method.conf"
+fi

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+xdpyinfo -display "${DISPLAY:-:1}" >/dev/null 2>&1
+bash -c '</dev/tcp/127.0.0.1/5900' 2>/dev/null
+bash -c '</dev/tcp/127.0.0.1/6080' 2>/dev/null
+bash -c '</dev/tcp/127.0.0.1/8787' 2>/dev/null
+pgrep -x wechat >/dev/null
+pgrep -x fcitx5 >/dev/null

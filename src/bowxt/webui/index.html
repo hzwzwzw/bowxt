@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>bowxt</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <aside class="sidebar">
+      <header class="brand">
+        <div class="mark">B</div>
+        <div><h1>bowxt</h1><p>微信消息中枢</p></div>
+        <button id="add-chat" class="icon-button" aria-label="添加会话">＋</button>
+      </header>
+      <div class="connection"><span id="status-dot"></span><span id="status-text">正在连接</span></div>
+      <div id="chat-list" class="chat-list" aria-label="会话列表"></div>
+    </aside>
+
+    <section class="conversation">
+      <header class="conversation-header">
+        <div>
+          <h2 id="chat-title">选择一个会话</h2>
+          <p id="chat-meta">消息通过可见微信界面安全收发</p>
+        </div>
+        <a class="vnc-link" href="http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale" target="_blank" rel="noreferrer">查看微信</a>
+      </header>
+      <div id="empty-state" class="empty-state">
+        <div class="empty-mark">文</div>
+        <h3>从左侧选择或添加会话</h3>
+        <p>新消息到达微信侧边栏后，bowxt 也会自动发现会话。</p>
+      </div>
+      <div id="messages" class="messages" hidden aria-live="polite"></div>
+      <form id="composer" class="composer" hidden>
+        <textarea id="message-input" rows="1" maxlength="2000" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+        <button id="send-button" type="submit">发送</button>
+      </form>
+    </section>
+  </main>
+
+  <dialog id="chat-dialog">
+    <form id="chat-form" class="dialog-card">
+      <div class="dialog-heading"><div><h2>添加会话</h2><p>名称必须与微信中的联系人或群聊完全一致</p></div><button type="button" id="close-dialog" class="icon-button">×</button></div>
+      <label>会话名称<input id="new-chat-name" required maxlength="128" autocomplete="off" placeholder="例如：张三"></label>
+      <label>会话类型<select id="new-chat-type"><option value="contact">联系人</option><option value="group">群聊</option><option value="unknown">自动判断 / 未知</option></select></label>
+      <div id="dialog-error" class="form-error"></div>
+      <button class="primary-button" type="submit">开始监听</button>
+    </form>
+  </dialog>
+  <script src="/app.js" defer></script>
+</body>
+</html>

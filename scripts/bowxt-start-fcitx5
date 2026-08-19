@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+until [[ -s /run/bowxt/session.env ]]; do sleep 0.2; done
+# shellcheck disable=SC1091
+source /run/bowxt/session.env
+/usr/local/bin/bowxt-configure-fcitx5
+export XMODIFIERS=@im=fcitx GTK_IM_MODULE=fcitx QT_IM_MODULE=fcitx INPUT_METHOD=fcitx
+exec /usr/bin/fcitx5 --replace

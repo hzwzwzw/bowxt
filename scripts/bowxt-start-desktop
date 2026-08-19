@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+until xdpyinfo -display "${DISPLAY:-:1}" >/dev/null 2>&1; do sleep 0.2; done
+
+exec dbus-run-session -- bash -lc '
+  set -euo pipefail
+  umask 077
+  {
+    printf "export DISPLAY=%q\n" "$DISPLAY"
+    printf "export DBUS_SESSION_BUS_ADDRESS=%q\n" "$DBUS_SESSION_BUS_ADDRESS"
+    printf "export HOME=%q\n" "$HOME"
+    printf "export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1\n"
+    printf "export NO_AT_BRIDGE=0\n"
+    printf "export XMODIFIERS=%q\n" "@im=fcitx"
+    printf "export GTK_IM_MODULE=fcitx\n"
+    printf "export QT_IM_MODULE=fcitx\n"
+    printf "export INPUT_METHOD=fcitx\n"
+  } > /run/bowxt/session.env
+  gsettings set org.gnome.desktop.interface toolkit-accessibility true 2>/dev/null || true
+  exec startxfce4
+'

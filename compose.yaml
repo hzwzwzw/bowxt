@@ -1,0 +1,44 @@
+name: bowxt
+
+services:
+  desktop:
+    image: bowxt:0.3.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        WECHAT_VERSION: 4.1.1.8
+        WECHAT_SHA256: c9765e87ee5133bf4bb50d585c1814fafd995e3fb0da62c5ed07259b43dada7b
+    container_name: bowxt
+    hostname: bowxt
+    environment:
+      DISPLAY: ":1"
+      VNC_RESOLUTION: "1280x900"
+      VNC_DEPTH: "24"
+      VNC_SCOPE: "${VNC_SCOPE:-window}"
+      BOWXT_POLL_GAP: "${BOWXT_POLL_GAP:-2.0}"
+      BOWXT_UIA_SENDER: "${BOWXT_UIA_SENDER:-0}"
+      TZ: Asia/Shanghai
+    ports:
+      - "127.0.0.1:${NOVNC_PORT:-6080}:6080"
+      - "127.0.0.1:${VNC_PORT:-5900}:5900"
+      - "127.0.0.1:${WEB_PORT:-8787}:8787"
+    volumes:
+      - wechat-home:/home/wechat
+    shm_size: "1gb"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - KILL
+      - SETGID
+      - SETUID
+
+volumes:
+  wechat-home:
+    name: bowxt-home

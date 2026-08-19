@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+until xdpyinfo -display "${DISPLAY:-:1}" >/dev/null 2>&1; do sleep 0.2; done
+
+target=(-display "${DISPLAY:-:1}")
+if [[ "${VNC_SCOPE:-window}" == window ]]; then
+  window_id=""
+  until window_id=$(/opt/bowxt-venv/bin/python -c \
+    'from bowxt.input import X11Input; backend=X11Input(); print(backend.find_wechat_window())' \
+    2>/dev/null) && [[ -n "$window_id" ]]; do
+    sleep 0.25
+  done
+  # -sid shifts the root framebuffer to the application window and tracks
+  # resizes. It is more tolerant of menus than capturing the child surface
+  # directly, though popups extending outside the window can still be clipped.
+  target=(-display "${DISPLAY:-:1}" -sid "$window_id")
+fi
+
+exec x11vnc "${target[@]}" -forever -shared -nopw -listen 0.0.0.0 \
+  -rfbport 5900 -noshm -noxdamage -repeat

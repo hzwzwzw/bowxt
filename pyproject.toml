@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bowxt"
+version = "0.3.0"
+description = "Containerized Linux WeChat with safe UI automation, persistence, and a web IM"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "AGPL-3.0-or-later"}
+authors = [{name = "bowxt contributors"}]
+keywords = ["wechat", "linux", "at-spi", "accessibility", "automation"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+]
+dependencies = []
+
+[project.optional-dependencies]
+vision = ["Pillow>=10"]
+
+[project.scripts]
+bowxt = "bowxt.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+bowxt = ["webui/*.html", "webui/*.css", "webui/*.js"]

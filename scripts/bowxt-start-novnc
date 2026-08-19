@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+until bash -c '</dev/tcp/127.0.0.1/5900' 2>/dev/null; do sleep 0.2; done
+exec websockify --web=/usr/share/novnc 0.0.0.0:6080 127.0.0.1:5900
