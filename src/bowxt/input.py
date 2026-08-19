@@ -11,13 +11,15 @@ from dataclasses import dataclass
 from typing import Iterator, Protocol
 
 from .errors import AccessibilityUnavailable, ControlNotFound
-from .models import Rect
+from .models import MessageImage, Rect
 
 
 class InputBackend(Protocol):
     def focus_wechat(self) -> None: ...
 
-    def click(self, x: int, y: int, *, count: int = 1) -> None: ...
+    def click(
+        self, x: int, y: int, *, count: int = 1, allow_wechat_window_change: bool = False
+    ) -> None: ...
 
     def shortcut(self, *keys: str) -> None: ...
 
@@ -98,6 +100,103 @@ class X11Clipboard:
         if result.returncode:
             return None
         return result.stdout.decode("utf-8", "replace")
+
+    def targets(self) -> tuple[str, ...]:
+        result = subprocess.run(
+            ["xclip", "-selection", "clipboard", "-target", "TARGETS", "-out"],
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode:
+            return ()
+        return tuple(
+            line.strip()
+            for line in result.stdout.decode("utf-8", "replace").splitlines()
+            if line.strip()
+        )
+
+    def read_bytes(self, mime_type: str) -> bytes | None:
+        result = subprocess.run(
+            ["xclip", "-selection", "clipboard", "-target", mime_type, "-out"],
+            check=False,
+            capture_output=True,
+        )
+        return result.stdout if result.returncode == 0 and result.stdout else None
+
+    def write_bytes(self, mime_type: str, value: bytes) -> None:
+        subprocess.run(
+            ["xclip", "-selection", "clipboard", "-target", mime_type, "-in"],
+            input=value,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def read_image(self) -> MessageImage | None:
+        """Read and validate a clipboard image, normalizing it to PNG."""
+
+        from io import BytesIO
+
+        from PIL import Image
+
+        offered = set(self.targets())
+        for mime_type in ("image/png", "image/jpeg", "image/jpg", "image/webp", "image/bmp"):
+            if mime_type not in offered:
+                continue
+            payload = self.read_bytes(mime_type)
+            if not payload or len(payload) > 25 * 1024 * 1024:
+                continue
+            try:
+                with Image.open(BytesIO(payload)) as opened:
+                    opened.load()
+                    width, height = opened.size
+                    if width < 1 or height < 1 or width * height > 80_000_000:
+                        continue
+                    if mime_type == "image/png":
+                        normalized = payload
+                    else:
+                        output = BytesIO()
+                        opened.save(output, format="PNG")
+                        normalized = output.getvalue()
+            except (OSError, ValueError):
+                continue
+            return MessageImage(
+                normalized,
+                mime_type="image/png",
+                width=width,
+                height=height,
+                source="viewer_clipboard",
+            )
+        return None
+
+    def _snapshot(self) -> tuple[str, bytes] | None:
+        offered = set(self.targets())
+        for mime_type in (
+            "image/png",
+            "image/jpeg",
+            "text/plain;charset=utf-8",
+            "UTF8_STRING",
+            "text/plain",
+            "STRING",
+        ):
+            if mime_type in offered:
+                value = self.read_bytes(mime_type)
+                if value is not None and len(value) <= 25 * 1024 * 1024:
+                    return mime_type, value
+        value = self.read()
+        return ("text/plain;charset=utf-8", value.encode("utf-8")) if value is not None else None
+
+    @contextlib.contextmanager
+    def preserved(self) -> Iterator[None]:
+        previous = self._snapshot() if self.restore else None
+        try:
+            yield
+        finally:
+            if self.restore:
+                if previous is None:
+                    self.clear()
+                else:
+                    self.write_bytes(*previous)
 
     def write(self, value: str) -> None:
         subprocess.run(
@@ -431,7 +530,14 @@ class X11Input:
         if not self.x11.XSendEvent(self.display, root, 0, mask, ctypes.byref(event)):
             raise ControlNotFound("failed to request WeChat activation from the window manager")
 
-    def click(self, x: int, y: int, *, count: int = 1) -> None:
+    def click(
+        self,
+        x: int,
+        y: int,
+        *,
+        count: int = 1,
+        allow_wechat_window_change: bool = False,
+    ) -> None:
         self.focus_wechat()
         logical_x, logical_y = int(x), int(y)
         event_x, event_y = self._to_x11_point(logical_x, logical_y)
@@ -456,7 +562,8 @@ class X11Input:
             self.x11.XFlush(self.display)
             time.sleep(self.event_delay)
         if self.active_window() != self.find_wechat_window():
-            raise ControlNotFound("click left the WeChat window; subsequent input was cancelled")
+            if not allow_wechat_window_change or not self.is_active_wechat_window():
+                raise ControlNotFound("click left the WeChat window; subsequent input was cancelled")
 
     def shortcut(self, *keys: str) -> None:
         if not keys:
@@ -474,6 +581,30 @@ class X11Input:
 
     def press(self, key: str) -> None:
         self.shortcut(key)
+
+    def is_active_wechat_window(self) -> bool:
+        window = self.active_window()
+        if window is None:
+            return False
+        instance, class_name = self._class_hint(window)
+        return instance.casefold() in {"wechat", "weixin"} or class_name.casefold() in {
+            "wechat", "weixin"
+        }
+
+    def shortcut_active_wechat(self, *keys: str) -> None:
+        """Send keys only to the already-active verified WeChat top-level window."""
+
+        if not keys:
+            return
+        if not self.is_active_wechat_window():
+            raise ControlNotFound("the active window is not WeChat; keyboard input was cancelled")
+        codes = [self._keycode(key) for key in keys]
+        for code in codes:
+            self.xtst.XTestFakeKeyEvent(self.display, code, 1, 0)
+        for code in reversed(codes):
+            self.xtst.XTestFakeKeyEvent(self.display, code, 0, 0)
+        self.x11.XFlush(self.display)
+        time.sleep(self.event_delay)
 
     def _keycode(self, key: str) -> int:
         symbol = self._KEY_NAMES.get(key.casefold(), key)

@@ -16,6 +16,28 @@
       </header>
       <div class="connection"><span id="status-dot"></span><span id="status-text">正在连接</span></div>
       <div id="chat-list" class="chat-list" aria-label="会话列表"></div>
+      <section class="runtime-controls" aria-label="同步控制">
+        <div class="control-row">
+          <label for="sync-mode">同步模式</label>
+          <span id="queue-depth" class="queue-depth">队列 0</span>
+        </div>
+        <select id="sync-mode" class="mode-select">
+          <option value="polling">轮询所有会话</option>
+          <option value="unread">新消息唤醒</option>
+          <option value="paused">暂停</option>
+        </select>
+        <label class="speed-control" for="poll-gap">
+          <span id="poll-gap-label">轮询间隔</span><output id="poll-gap-value" for="poll-gap">1.5 秒</output>
+        </label>
+        <input id="poll-gap" type="range" min="1.5" max="8" step="0.5" value="1.5">
+        <label class="speed-control" for="action-delay">
+          <span>键鼠操作间隔</span><output id="action-delay-value" for="action-delay">120 ms</output>
+        </label>
+        <input id="action-delay" type="range" min="0.06" max="0.30" step="0.01" value="0.12">
+        <p id="mode-help">轮询模式会依次打开所有已监听会话。</p>
+        <p>越短操作越快；发送频率限流仍保持不变。</p>
+        <p id="send-timing" class="send-timing" hidden></p>
+      </section>
     </aside>
 
     <section class="conversation">
@@ -24,7 +46,11 @@
           <h2 id="chat-title">选择一个会话</h2>
           <p id="chat-meta">消息通过可见微信界面安全收发</p>
         </div>
-        <a class="vnc-link" href="http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale" target="_blank" rel="noreferrer">查看微信</a>
+        <nav class="view-tabs" aria-label="内容视图">
+          <button id="show-chat" class="view-tab active" type="button">对话</button>
+          <button id="show-logs" class="view-tab" type="button">Agent 日志</button>
+        </nav>
+        <a class="vnc-link" href="http://127.0.0.1:6080/vnc.html?autoconnect=1&amp;resize=scale&amp;reconnect=1&amp;reconnect_delay=1000" target="_blank" rel="noreferrer">查看微信</a>
       </header>
       <div id="empty-state" class="empty-state">
         <div class="empty-mark">文</div>
@@ -32,6 +58,21 @@
         <p>新消息到达微信侧边栏后，bowxt 也会自动发现会话。</p>
       </div>
       <div id="messages" class="messages" hidden aria-live="polite"></div>
+      <section id="log-panel" class="log-panel" hidden aria-label="Agent 日志">
+        <div class="log-toolbar">
+          <input id="log-search" type="search" placeholder="搜索 Agent、事件或日志正文" aria-label="搜索日志">
+          <select id="log-level" aria-label="日志级别">
+            <option value="all">全部级别</option>
+            <option value="debug">Debug</option>
+            <option value="info">Info</option>
+            <option value="warning">Warning</option>
+            <option value="error">Error</option>
+          </select>
+          <label class="follow-toggle"><input id="log-follow" type="checkbox" checked> 自动跟随</label>
+          <button id="copy-logs" type="button">复制可见日志</button>
+        </div>
+        <div id="logs" class="logs" aria-live="polite"></div>
+      </section>
       <form id="composer" class="composer" hidden>
         <textarea id="message-input" rows="1" maxlength="2000" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
         <button id="send-button" type="submit">发送</button>

@@ -1,12 +1,88 @@
 import unittest
+from unittest.mock import patch
 
 from bowxt import ChatType, SafetyPolicy, WeChatClient
-from bowxt.models import Rect
+from bowxt.models import Direction, Message, MessageImage, MessageType, Rect
 
 from fakes import FakeAccessibility, FakeClipboard, FakeInput, FakeNode, sample_tree
 
 
 class ClientTests(unittest.TestCase):
+    def test_visible_image_bubble_is_captured_without_enabling_sender_enrichment(self):
+        root, message_list = sample_tree()
+        picture_bounds = Rect(310, 210, 180, 120)
+        message_list.nodes = [FakeNode(
+            "list item",
+            attributes={"class": "message incoming image_message"},
+            bounds=Rect(250, 190, 650, 150),
+            token="image-row",
+            nodes=[
+                FakeNode("image", "头像", bounds=Rect(260, 205, 40, 40), token="avatar"),
+                FakeNode("image", "图片", bounds=picture_bounds, token="picture"),
+            ],
+        )]
+
+        class Snapshot:
+            def locate_image(self, _bounds):
+                return picture_bounds
+
+            def read_image(self, bounds):
+                self.bounds = bounds
+                return MessageImage(b"png-pixels", width=bounds.width, height=bounds.height)
+
+            def classify(self, _bounds):
+                return Direction.INCOMING
+
+        snapshot = Snapshot()
+        client = WeChatClient(accessibility=FakeAccessibility(root)).connect()
+        with patch("bowxt.vision.VisualDirectionDetector.capture", return_value=snapshot):
+            messages = client.get_visible_messages(chat_type=ChatType.CONTACT)
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].type, MessageType.IMAGE)
+        self.assertEqual(messages[0].image.data, b"png-pixels")
+        self.assertEqual(snapshot.bounds, picture_bounds)
+
+    def test_image_row_is_not_captured_when_picture_region_is_not_visible(self):
+        root, message_list = sample_tree()
+        message_list.nodes = [FakeNode(
+            "list item", "图片", bounds=Rect(250, 190, 650, 80), token="clipped-image-row"
+        )]
+
+        class Snapshot:
+            def locate_image(self, _bounds):
+                return None
+
+            def read_image(self, _bounds):
+                raise AssertionError("the whole row must not be persisted as an image")
+
+            def classify(self, _bounds):
+                return Direction.INCOMING
+
+        client = WeChatClient(accessibility=FakeAccessibility(root)).connect()
+        with patch("bowxt.vision.VisualDirectionDetector.capture", return_value=Snapshot()):
+            messages = client.get_visible_messages(chat_type=ChatType.CONTACT)
+
+        self.assertEqual(messages[0].type, MessageType.IMAGE)
+        self.assertIsNone(messages[0].image)
+
+    def test_operation_delay_updates_input_pacing_without_weakening_send_limits(self):
+        inputs = FakeInput()
+        inputs.event_delay = 0.06
+        policy = SafetyPolicy(min_send_interval=2.4, send_jitter=0.5)
+        client = WeChatClient(input_backend=inputs, safety=policy)
+
+        self.assertEqual(client.set_operation_delay(0.08), 0.08)
+
+        self.assertEqual(client.safety.action_delay, 0.08)
+        self.assertEqual(client.safety.paste_settle_delay, 0.16)
+        self.assertEqual(client.safety.min_send_interval, 2.4)
+        self.assertEqual(client.safety.send_jitter, 0.5)
+        self.assertEqual(client._limiter.policy, client.safety)
+        self.assertEqual(inputs.event_delay, 0.04)
+        with self.assertRaises(ValueError):
+            client.set_operation_delay(0.03)
+
     @staticmethod
     def _profile_fixture(*, closes_on_escape=True):
         root, message_list = sample_tree()
@@ -36,7 +112,7 @@ class ClientTests(unittest.TestCase):
         class ProfileInput(FakeInput):
             def click(self, x, y, *, count=1):
                 super().click(x, y, count=count)
-                if (x, y) == (294, 226):
+                if (x, y) == (286, 226):
                     accessibility.popup = profile
 
             def press(self, key):
@@ -63,6 +139,78 @@ class ClientTests(unittest.TestCase):
         self.assertIsNone(accessibility.popup)
         self.assertIn(("press", "esc"), inputs.events)
         self.assertFalse(client._interaction_blocked)
+
+        # The sender result is cached by the stable visible-message ID, so the
+        # next poll does not reopen the same person's profile card.
+        profile_clicks = [event for event in inputs.events if event[:3] == ("click", 286, 226)]
+        messages = client.get_visible_messages(chat_type=ChatType.GROUP)
+        self.assertEqual(next(item for item in messages if item.content == "你好").sender, "张三")
+        self.assertEqual(
+            [event for event in inputs.events if event[:3] == ("click", 286, 226)],
+            profile_clicks,
+        )
+
+    def test_profile_cleanup_escapes_the_active_wechat_transient(self):
+        root, accessibility, inputs = self._profile_fixture()
+        inputs.active_wechat = True
+
+        def is_active_wechat_window():
+            return inputs.active_wechat
+
+        def shortcut_active_wechat(*keys):
+            inputs.events.append(("shortcut-active", *keys))
+            if keys == ("esc",):
+                accessibility.popup = None
+
+        inputs.is_active_wechat_window = is_active_wechat_window
+        inputs.shortcut_active_wechat = shortcut_active_wechat
+        client = WeChatClient(
+            accessibility=accessibility,
+            input_backend=inputs,
+            uia_sender=True,
+            sleeper=lambda _seconds: None,
+        ).connect()
+
+        messages = client.get_visible_messages(chat_type=ChatType.GROUP)
+
+        self.assertEqual(next(item for item in messages if item.content == "你好").sender, "张三")
+        self.assertIn(("shortcut-active", "esc"), inputs.events)
+        self.assertNotIn(("press", "esc"), inputs.events)
+        self.assertIsNone(accessibility.popup)
+
+    def test_explicit_sender_enrichment_processes_the_whole_new_burst(self):
+        root, _message_list = sample_tree()
+        client = WeChatClient(
+            accessibility=FakeAccessibility(root),
+            input_backend=FakeInput(),
+            uia_sender=True,
+            sleeper=lambda _seconds: None,
+        ).connect()
+        reads = []
+
+        def read_sender(bounds, **_kwargs):
+            reads.append(bounds.y)
+            return f"成员{len(reads)}"
+
+        client._read_profile_sender = read_sender
+        messages = [
+            Message(
+                id=f"new-{index}",
+                chat="群",
+                content=f"消息{index}",
+                type=MessageType.TEXT,
+                direction=Direction.INCOMING,
+                sender=None,
+                chat_type=ChatType.GROUP,
+                bounds=Rect(260, 180 + index * 60, 240, 50),
+            )
+            for index in (1, 2, 3)
+        ]
+
+        enriched = client.enrich_visible_senders(messages, chat="测试群")
+
+        self.assertEqual(reads, [240, 300, 360])
+        self.assertEqual([item.sender for item in enriched], ["成员1", "成员2", "成员3"])
 
     def test_profile_that_will_not_close_locks_all_later_input(self):
         _root, accessibility, inputs = self._profile_fixture(closes_on_escape=False)
@@ -128,10 +276,19 @@ class ClientTests(unittest.TestCase):
 
         self.assertTrue(WeChatClient._is_chat_open(root, "张三"))
 
+    def test_visible_group_title_ignores_separate_member_count_label(self):
+        root, _message_list = sample_tree()
+        root.nodes.append(FakeNode(
+            "label", "(21)", bounds=Rect(625, 30, 35, 30), token="member-count"
+        ))
+        client = WeChatClient(accessibility=FakeAccessibility(root)).connect()
+
+        self.assertEqual(client.visible_chat_name(), "测试群")
+
     def test_unread_discovery_clicks_visible_row_and_reads_header_without_splitting_preview(self):
         root, _message_list = sample_tree()
         header = next(node for node in root.nodes if node.token == "header")
-        header.name = "新 会话(8)"
+        header.name = "原会话"
         unread = FakeNode(
             "list item",
             "新 会话 2条未读 Alice: 含 空格的预览 19:30",
@@ -142,7 +299,13 @@ class ClientTests(unittest.TestCase):
             "list", "会话", bounds=Rect(20, 100, 210, 600), nodes=[unread], token="sessions"
         )
         root.nodes.insert(1, sessions)
-        inputs = FakeInput()
+        class UnreadInput(FakeInput):
+            def click(self, x, y, *, count=1):
+                super().click(x, y, count=count)
+                if (x, y) == unread.bounds.center:
+                    header.name = "新 会话(8)"
+
+        inputs = UnreadInput()
         client = WeChatClient(
             accessibility=FakeAccessibility(root),
             input_backend=inputs,
@@ -153,6 +316,36 @@ class ClientTests(unittest.TestCase):
 
         self.assertEqual(discovered, ["新 会话"])
         self.assertEqual(inputs.events, [("click", *unread.bounds.center, 1)])
+
+    def test_unread_discovery_opens_every_badged_row_in_one_scan(self):
+        root, _message_list = sample_tree()
+        header = next(node for node in root.nodes if node.token == "header")
+        header.name = "原会话"
+        rows = [
+            FakeNode(
+                "list item",
+                f"会话{name} 1条未读 预览",
+                bounds=Rect(20, 100 + index * 68, 210, 68),
+                token=f"unread-{index}",
+            )
+            for index, name in enumerate(("甲", "乙"))
+        ]
+        root.nodes.insert(1, FakeNode(
+            "list", "会话", bounds=Rect(20, 100, 210, 600), nodes=rows, token="sessions"
+        ))
+
+        class BurstInput(FakeInput):
+            def click(self, x, y, *, count=1):
+                super().click(x, y, count=count)
+                header.name = "会话甲" if (x, y) == rows[0].bounds.center else "会话乙"
+
+        client = WeChatClient(
+            accessibility=FakeAccessibility(root),
+            input_backend=BurstInput(),
+            sleeper=lambda _seconds: None,
+        ).connect()
+
+        self.assertEqual(client.discover_unread_chats(limit=32), ["会话甲", "会话乙"])
 
     def test_send_uses_only_click_clipboard_shortcuts_and_enter(self):
         root, _message_list = sample_tree()
@@ -171,6 +364,36 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(clipboard.values, ["hello"])
         self.assertEqual(inputs.events.count(("shortcut", "ctrl", "v")), 1)
         self.assertIn(("press", "enter"), inputs.events)
+        self.assertEqual(
+            set(receipt.timings),
+            {"rate_limit_s", "open_chat_s", "input_to_enter_s", "verify_s", "total_s"},
+        )
+
+    def test_send_verification_never_opens_group_sender_profiles(self):
+        root, message_list = sample_tree()
+        avatar = next(node for node in message_list.nodes[0].nodes if node.token == "avatar")
+        avatar.name = ""
+        client = WeChatClient(
+            accessibility=FakeAccessibility(root),
+            input_backend=FakeInput(),
+            clipboard=FakeClipboard(),
+            safety=SafetyPolicy(
+                min_send_interval=0,
+                send_jitter=0,
+                action_delay=0,
+                paste_settle_delay=0,
+            ),
+            sleeper=lambda _seconds: None,
+            uia_sender=True,
+            my_names=["Me"],
+        ).connect()
+        client._enrich_uia_senders = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("profile enrichment reached the send verification path")
+        )
+
+        receipt = client.send_text("测试群", "hello", chat_type=ChatType.GROUP)
+
+        self.assertTrue(receipt.verified)
 
     def test_send_mention_selects_exact_popup_row_and_verifies_rich_token(self):
         root, _message_list = sample_tree()

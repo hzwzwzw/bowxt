@@ -1,198 +1,228 @@
 # bowxt
 
-`bowxt`（wx + box + bot）是一个可通过 VNC 访问的容器化 Linux 微信，同时提供安全的
-桌面自动化 API、持续多会话监听、SQLite 消息持久化和一个现代 Web IM。
+`bowxt`（wx + box + bot）是一个面向 Linux 的微信消息收发框架。它在 Docker 中运行官方
+Linux 微信，通过 AT-SPI 读取可见控件树，并用真实键鼠事件完成界面操作，同时提供 Web IM、
+HTTP API 和面向 Agent 的 Python 客户端。
 
-它只控制官方 Linux 微信的可见界面：AT-SPI 负责只读控件树，发送使用 XTest 真实键鼠事件和
-系统剪贴板。项目不使用微信协议、私有 API、数据库解密、进程注入、深层控件写入或 OCR。
+项目不接入微信私有协议，也不要求修改微信进程。
 
-## 主要功能
+## 功能
 
-- 固定 Ubuntu 24.04 基础镜像和官方微信 `4.1.1.8` 安装包 SHA-256；
-- Xvfb + XFCE + x11vnc + noVNC，默认仅转发微信窗口；
-- fcitx5 拼音和中文字体，VNC 中可直接中文输入；
-- 联系人、群聊文字读取与发送，支持群内真实富文本 `@`；
-- 单 UI 工作线程安全调度多个会话，外部 HTTP 调用可并发提交；
-- 自动发现微信侧边栏中的可见未读会话；
-- 成功观察到的收发消息写入 SQLite，重启后继续保留；
-- Web IM 支持会话自动出现、手动新增、实时消息流和文字收发；
-- 发送频率、单会话频率和文本长度限制默认启用。
+- 通过 noVNC 或 VNC 查看和操作容器中的官方 Linux 微信；
+- 读取、发送联系人和群聊文字消息，支持群发送人、`@我`、富文本 `@成员` 和图片读取；
+- 在“轮询 / 新消息唤醒 / 暂停”三种同步模式间切换；
+- 多会话持久化、消息去重、异步发送队列和发送状态跟踪；
+- Web IM 对话、会话添加、未读提示、历史翻页、图片显示和实时更新；
+- 面向 Agent 的独立消费游标、批量领取、租约、ACK/NACK、崩溃重投和幂等发送；
+- 独立的 Agent 日志通道，支持持久化、实时跟随、级别过滤、搜索和复制。
 
 ## 快速开始
 
-要求：Linux amd64、Docker Engine，以及能用手机确认登录的微信账号。
+要求：Linux amd64、Docker Engine，以及可在手机端确认登录的微信账号。
 
 ```bash
 git clone https://github.com/hzwzwzw/bowxt.git
 cd bowxt
+cp .env.example .env
 ./scripts/init.sh
 ```
 
-初始化脚本会构建固定版本镜像并启动容器。随后访问：
+启动后访问：
 
 - Web IM：<http://127.0.0.1:8787/>
-- 微信单窗口 noVNC：<http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale>
+- 微信 noVNC：<http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale&reconnect=1&reconnect_delay=1000>
 - 原生 VNC：`127.0.0.1:5900`
 
-第一次启动时在 noVNC 中扫码并用手机确认。登录状态、fcitx5 用户配置、聊天数据库和微信数据
-都保存在 Docker volume `bowxt-home`；普通停止、更新镜像或替换容器不会删除它。
+首次启动时在 noVNC 中登录微信并用手机确认。登录状态、微信数据和 bowxt 数据库保存在
+`bowxt-home` Docker volume 中，普通停止和容器更新不会删除它。noVNC 已启用自动重连，可处理
+登录窗口切换为微信主窗口时的短暂断开。
 
-端口只绑定宿主 `127.0.0.1`。从另一台电脑访问时应使用 SSH 隧道，不要把端口直接暴露到公网：
+端口默认只绑定宿主机 `127.0.0.1`。远程访问建议使用 SSH 隧道：
 
 ```bash
 ssh -L 8787:127.0.0.1:8787 -L 6080:127.0.0.1:6080 USER@DOCKER_HOST
 ```
 
-## 常用管理命令
+常用管理命令：
 
 ```bash
-./manage.sh build               # 构建固定版本镜像
-./manage.sh up                  # 启动并等待健康检查
-./manage.sh open                # 打开 Web IM
-./manage.sh vnc                 # 打开微信单窗口 noVNC
-./manage.sh ready               # 检查微信是否登录并暴露主控件树
-./manage.sh doctor              # 输出脱敏的 AT-SPI 诊断树
-./manage.sh input-method        # 检查 fcitx5 和输入法环境变量
-./manage.sh unit                # 容器内运行测试
+./manage.sh build
+./manage.sh up
+./manage.sh ready
+./manage.sh doctor
+./manage.sh unit
+./manage.sh logs
+./manage.sh down       # 保留登录和消息数据
+```
+
+## 配置
+
+复制 `.env.example` 为 `.env` 后按需修改：
+
+| 配置 | 说明 |
+|---|---|
+| `BOWXT_SYNC_MODE` | 启动模式：`polling`、`unread` 或 `paused` |
+| `BOWXT_POLL_GAP` | 会话轮询或未读检查间隔 |
+| `BOWXT_ACTION_DELAY` | 普通键鼠操作间隔 |
+| `BOWXT_UIA_SENDER` | 是否通过可见资料卡补全群发送人 |
+| `BOWXT_MY_NAMES` | 当前账号在群内可能被 `@` 的名称，多个值用逗号分隔 |
+| `VNC_SCOPE` | `window` 只转发微信，`desktop` 转发完整桌面 |
+| `WEB_PORT` / `NOVNC_PORT` / `VNC_PORT` | 宿主机监听端口 |
+
+例如：
+
+```dotenv
+BOWXT_SYNC_MODE=unread
+BOWXT_MY_NAMES=kirotta,bowxt
+VNC_SCOPE=window
+```
+
+`.env` 是本机配置，不会提交到 Git，也不会复制进 Docker 镜像。显式设置的环境变量可以临时
+覆盖其中的值。
+
+## Web IM
+
+Web IM 提供两个页面：
+
+- **对话**：点击左上角 `+` 添加联系人或群聊；支持会话切换、未读红点、历史消息翻页、图片、
+  乐观发送气泡和异步发送状态。发送任务在后台串行操作微信，输入框不会等待上一条消息完成。
+- **Agent 日志**：显示 Agent 通过日志 API 写入的持久化日志，支持实时跟随、级别过滤、全文
+  搜索、复制和向前加载历史。日志与微信消息完全分开，不会生成聊天气泡或触发微信操作。
+
+左下角可以切换同步模式并调整轮询、键鼠间隔：
+
+- `polling`：按顺序检查全部已启用会话；
+- `unread`：优先根据会话列表的新消息标记唤醒，只跳转需要读取的会话；当前已打开的受监控
+  会话会原地读取，因为微信不会为当前会话显示红点；
+- `paused`：当前操作结束后停止读取、切换和发送，并拒绝新的发送请求。
+
+通过 API 添加会话：
+
+```bash
 ./manage.sh add-chat 张三 contact
 ./manage.sh add-chat 测试群 group
-./manage.sh logs
-./manage.sh down                # 保留所有持久化数据
 ```
 
-默认 `VNC_SCOPE=window`，只看到微信顶层窗口。需要处理伸出微信窗口边界的独立弹层时：
+## Agent 开发
 
-```bash
-VNC_SCOPE=desktop ./manage.sh up
+Agent 应连接已经运行的 bowxt Web 服务，不要创建第二个直接操作微信的 UI 客户端。
+
+```python
+from bowxt import AgentClient, ChatType
+
+agent = AgentClient("support-bot")
+group = agent.ensure_chat("答疑群", ChatType.GROUP)
+
+def handle(delivery):
+    message = delivery.message
+    agent.log(
+        "info",
+        f"收到 {message.sender}: {message.content}",
+        event="message_received",
+        context={"seq": message.seq},
+    )
+    agent.reply_text(delivery, make_answer(message.content))
+
+agent.run_forever(
+    handle,
+    chat_ids=[group.id],
+    require_sender=True,
+    require_at_me=True,
+)
 ```
 
-恢复单窗口：
+每个 `consumer` 拥有独立、持久化的消费进度。新 consumer 默认从当前消息末尾开始，避免 Agent
+上线后回复历史消息；需要导入历史时可在第一次 `claim()` 使用 `replay_existing=True`。领取的
+消息带租约，处理成功后 ACK，失败时 NACK；进程崩溃后租约到期会重新投递。
 
-```bash
-VNC_SCOPE=window ./manage.sh up
-```
+`send_text()`、`reply_text()` 和 `forward_text()` 都是异步、可幂等提交。`pending` 仅表示进入
+队列；最终状态可通过 `wait_delivery()` 或消息 API 查询。图片消息可使用 `download_image()`
+获取 bowxt 已保存的图片。
 
-`up` 检测到镜像或显示模式变化时会替换容器，但保留数据卷；微信仍可能要求在手机端再次确认。
+完整接口、投递语义和更多示例见 [AGENT_API.md](AGENT_API.md)，最小可运行示例见
+[examples/agent_echo.py](examples/agent_echo.py)。
 
-## Web IM 与 HTTP API
+## HTTP API
 
-Web 服务默认监听容器 `8787`。浏览器通过 SSE 接收新增会话、消息和服务状态，不需要刷新。
+常用端点：
 
 ```text
 GET    /api/status
 GET    /api/chats
-POST   /api/chats                     {"name":"第二联系人","chat_type":"contact"}
-PATCH  /api/chats/{id}                {"chat_type":"group"}
-GET    /api/chats/{id}/messages?after=0&limit=200
-GET    /api/chats/{id}/messages?limit=1&recent=1
-POST   /api/chats/{id}/messages       {"text":"你好"}
-GET    /api/events                    text/event-stream
+POST   /api/chats
+PATCH  /api/chats/{id}
+GET    /api/chats/{id}/messages
+POST   /api/chats/{id}/messages
+GET    /api/messages?after={seq}
+GET    /api/messages/{seq}
+GET    /api/messages/{seq}/image
+PATCH  /api/control
+GET    /api/events
+
+POST   /api/agents/{consumer}/claim
+POST   /api/agents/{consumer}/deliveries/{seq}/ack
+POST   /api/agents/{consumer}/deliveries/{seq}/nack
+GET    /api/agent/logs
+POST   /api/agent/logs
 ```
 
-Web/API 线程不会直接操作微信。所有读取、焦点切换和发送都会进入同一个 UI 工作线程；它按会话
-轮询并优先处理发送队列。因此多个客户端可以并发提交任务，但同一个微信窗口不会被多个线程
-同时争抢。默认相邻 UI 轮询至少间隔 2 秒，代码拒绝低于 1.5 秒的配置。
+Web/API 请求不会直接并发操作微信。所有读取、切换和发送都由一个 UI 工作线程执行，发送任务
+优先于后台轮询、发送人补全和图片升级。
 
-自动新增会话采用保守路径：仅检查侧边栏中明确标记“未读”的可见行，通过普通点击打开后从
-聊天标题读取完整名称，不会猜测或用空格切割“名称 + 消息预览”。自动发现的会话先标记为
-`unknown`；可在 Web/API 中改为 `contact` 或 `group`。
+## 直接 Python API
 
-持续服务默认不打开群成员资料卡（`BOWXT_UIA_SENDER=0`），以降低长期运行中的界面扰动。
-需要群发送者昵称时可显式使用 `BOWXT_UIA_SENDER=1 ./manage.sh up`；资料卡安全退出验证仍会启用。
-
-## Python API
+一次性调试也可以直接使用 `WeChatClient`：
 
 ```python
-from bowxt import BowxtClient, ChatType
+from bowxt import ChatType, WeChatClient
 
-with BowxtClient(visual_direction=True, uia_sender=True) as wx:
+with WeChatClient(visual_direction=True, uia_sender=True) as wx:
     messages = wx.get_visible_messages("测试群", chat_type=ChatType.GROUP)
-    receipt = wx.send_text("张三", "bowxt 测试", chat_type=ChatType.CONTACT)
-    print(receipt.verified)
+    receipt = wx.send_text("张三", "你好", chat_type=ChatType.CONTACT)
+    print(messages, receipt.verified)
 ```
 
-多会话持久服务：
-
-```python
-from bowxt import BowxtService, ChatType, SQLiteStore
-
-service = BowxtService(SQLiteStore("messages.db"))
-chat = service.add_chat("第二联系人", ChatType.CONTACT)
-service.start()
-service.send_text(chat.id, "你好")
-service.stop()
-```
-
-命令行保留适合调试的一次性接口：
+命令行提供对应的调试入口：
 
 ```bash
 bowxt read 测试群 --type group --uia-sender
-bowxt send 张三 "明确的测试消息" --type contact --yes
+bowxt send 张三 "测试消息" --type contact --yes
 bowxt serve --host 127.0.0.1 --port 8787 --db ./messages.db
 ```
-
-## 消息持久化
-
-默认数据库位于 `/home/wechat/.local/share/bowxt/messages.db`。SQLite 使用 WAL，表结构包含：
-
-- `chats`：会话名称、类型、来源、启用状态、最近消息和最近错误；
-- `messages`：会话内消息 ID、方向、发送者、正文、类型、时间、观察时间、@ 状态和验证状态。
-
-同一会话的微信消息 ID 有唯一约束。未能即时读到微信 ID 的已发送消息会先使用 `local:` ID，
-后续从控件树观察到同内容的发出消息时自动合并，避免页面出现两条。
-
-备份数据库和登录数据：
-
-```bash
-docker run --rm -v bowxt-home:/data -v "$PWD":/backup \
-  ubuntu:24.04 tar -C /data -czf /backup/bowxt-home.tar.gz .
-```
-
-`./manage.sh purge-login` 会要求输入 `PURGE`，然后删除整个持久化卷；不要把它用于普通升级。
-
-## fcitx5 中文输入
-
-镜像安装 `fcitx5`、`fcitx5-chinese-addons`、GTK3 和 Qt5 前端，并为新数据卷配置
-`keyboard-us` 与 `pinyin`。桌面会话与微信进程都设置：
-
-```text
-XMODIFIERS=@im=fcitx
-GTK_IM_MODULE=fcitx
-QT_IM_MODULE=fcitx
-INPUT_METHOD=fcitx
-```
-
-在 VNC 中使用 `Ctrl+Space` 切换拼音。自动化发送仍优先使用临时剪贴板并在完成后恢复原内容，
-不依赖输入法当前状态。
-
-## 初始化脚本
-
-- `scripts/init.sh`：构建并启动完整环境；
-- `scripts/build.sh`：仅构建 Docker 镜像；
-- `scripts/install-wechat.sh`：下载官方 deb、严格校验哈希并验证安装版本；
-- `scripts/configure-fcitx5.sh`：为当前用户写入可复用的拼音默认配置；
-- `scripts/bowxt-*`：容器内 X11、桌面、输入法、微信、VNC、Web 和健康检查入口。
 
 ## 开发与测试
 
 ```bash
 python3 -m venv --system-site-packages .venv
 .venv/bin/pip install -e .
-PYTHONPATH=src:tests python3 -m unittest discover -s tests -v
+PYTHONPATH=src:tests python3 -W error::ResourceWarning -m unittest discover -s tests -v
 bash -n manage.sh scripts/*
+python3 -m compileall -q src tests
 ```
 
-当前版本包含 43 项单元测试，覆盖控件选择、X11/XWayland 坐标映射、剪贴板恢复、资料卡退出、富文本 `@`、限流、
-多会话调度、SQLite 重启/去重、并发调用串行化和 Web API。实机验证步骤记录在
-[`VALIDATION.md`](VALIDATION.md)，开发约束见 [`AGENT.md`](AGENT.md)。
+实机验证记录见 [VALIDATION.md](VALIDATION.md)，开发约束见 [AGENT.md](AGENT.md)。
 
-## 限制与安全边界
+## 限制
 
-- “持续”表示服务长期轮询微信当前可渲染的消息；不会滚动并导出完整历史。
-- 一个微信窗口在物理上只能激活一个会话，因此多会话通过单工作线程公平轮询，不是多窗口并发。
-- 资料卡发送者补全会短暂打开可见资料卡，并以 `Esc` + 顶层窗口消失 + 原会话仍打开三重验证退出；
-  失败后该客户端永久禁止继续输入。
-- 用户正在处理通话、资料卡等未知微信弹层时，框架不会替用户关闭，而是停止输入。
-- 默认仅适合自己的账号和少量已授权会话；不要用于群发、营销、陌生人触达或绕过微信限制。
+- 只能读取微信当前已渲染的消息，不会自动滚动并导出完整聊天历史。
+- 微信通常只公开一组消息的时间分隔，无法保证每个气泡都有独立、精确的发送时间。
+- 一个微信窗口同一时刻只能操作一个会话，因此多会话收发是串行调度，不是真正的多窗口并行。
+- 群发送人通常不在消息行控件树中，需要短暂打开资料卡补全；资料卡不可识别或无法退出时，本次
+  补全会失败。
+- 新消息唤醒依赖微信会话列表暴露的未读信息；不可见、未渲染或微信未标记的会话可能需要轮询
+  模式才能及时读取。
+- 图片只支持当前可见的图片气泡；文件、语音、视频、引用、红包等消息类型尚未提供完整内容接口。
+- 微信界面结构或版本变化可能导致控件选择器失效；容器替换后微信也可能要求再次手机确认。
+
+## Acknowledgement
+
+本项目仅供技术研究与实现思路参考，不保证适合生产环境或长期兼容微信版本。
+
+项目在设计与实现过程中参考了：
+
+- [wx4py](https://github.com/claw-codes/wx4py)
+- [RICwang/docker-wechat](https://github.com/RICwang/docker-wechat)
+
+感谢上述项目及其贡献者。
 
 许可证：AGPL-3.0-or-later。

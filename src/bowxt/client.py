@@ -13,7 +13,7 @@ from typing import Callable, Iterable
 from .accessibility import AtspiBackend, Node, read_accessible_text, walk
 from .errors import ChatNotFound, ControlNotFound, MentionSelectionError
 from .input import ClipboardBackend, InputBackend, WaylandClipboard, X11Clipboard, X11Input
-from .models import ChatType, Direction, Message, SendReceipt
+from .models import ChatType, Direction, Message, MessageType, SendReceipt
 from .parser import MessageParser
 from .safety import SafetyPolicy, SendRateLimiter
 from .selectors import (
@@ -86,6 +86,34 @@ class WeChatClient:
     def is_main_ui_ready(self) -> bool:
         return bool(self._root and find_search_box(self._root, self.profile))
 
+    @property
+    def is_input_blocked(self) -> bool:
+        """Whether a fail-closed transient-window check locked this session.
+
+        The lock is intentionally irreversible for this client instance: the
+        caller must discard it instead of assuming that a partially completed
+        UI operation is safe to resume.
+        """
+
+        return self._interaction_blocked
+
+    def set_operation_delay(self, value: float) -> float:
+        """Adjust real key/mouse pacing without weakening send rate limits."""
+
+        delay = float(value)
+        if not 0.06 <= delay <= 0.5:
+            raise ValueError("action_delay must be between 0.06 and 0.5 seconds")
+        with self._lock:
+            self.safety = replace(
+                self.safety,
+                action_delay=delay,
+                paste_settle_delay=max(0.12, delay * 2.0),
+            )
+            self._limiter.policy = self.safety
+            if self._input is not None and hasattr(self._input, "event_delay"):
+                self._input.event_delay = max(0.03, delay / 2.0)
+        return delay
+
     def connect(self) -> "WeChatClient":
         with self._lock:
             self.accessibility.connect()
@@ -135,7 +163,7 @@ class WeChatClient:
                 point = self._visible_center(visible_item, sessions)
                 if point:
                     input_backend.click(*point)
-                    quick_deadline = min(time.monotonic() + 2.0, time.monotonic() + timeout)
+                    quick_deadline = min(time.monotonic() + 0.9, time.monotonic() + timeout)
                     while time.monotonic() < quick_deadline:
                         if self._is_chat_open(root, chat):
                             self._chat = chat
@@ -150,7 +178,7 @@ class WeChatClient:
             input_backend.shortcut("ctrl", "a")
             with self._ensure_clipboard().text(chat):
                 input_backend.shortcut("ctrl", "v")
-                self._sleep(max(0.45, self.safety.paste_settle_delay))
+                self._sleep(max(0.18, self.safety.paste_settle_delay))
 
             deadline = time.monotonic() + timeout
             result: Node | None = None
@@ -177,6 +205,8 @@ class WeChatClient:
         chat: str | None = None,
         *,
         chat_type: ChatType | str = ChatType.UNKNOWN,
+        enrich_senders: bool = True,
+        sender_limit: int | None = None,
     ) -> list[Message]:
         """Read the currently rendered messages; this never scrolls the chat."""
 
@@ -206,28 +236,47 @@ class WeChatClient:
                 active_type is ChatType.GROUP
                 and any(item.sender is None for item in messages)
             )
-            needs_capture = needs_direction
-            if visual_enabled and root.bounds and needs_capture:
+            needs_image = any(
+                item.type is MessageType.IMAGE and item.bounds is not None
+                for item in messages
+            )
+            needs_capture = needs_direction or needs_image
+            if root.bounds and needs_capture:
                 try:
                     from .vision import VisualDirectionDetector
 
                     snapshot = VisualDirectionDetector().capture(root.bounds)
-                    messages = [
-                        replace(
-                            item,
-                            direction=snapshot.classify(item.bounds),
-                            raw={**item.raw, "direction_source": "window_pixels"},
-                        )
-                        if item.direction is Direction.UNKNOWN and item.bounds else item
-                        for item in messages
-                    ]
+                    captured = []
+                    for item in messages:
+                        updates = {}
+                        raw = dict(item.raw)
+                        if item.direction is Direction.UNKNOWN and item.bounds:
+                            updates["direction"] = snapshot.classify(item.bounds)
+                            raw["direction_source"] = "window_pixels"
+                        if item.type is MessageType.IMAGE and item.bounds:
+                            image_bounds = snapshot.locate_image(item.bounds)
+                            image = snapshot.read_image(image_bounds) if image_bounds else None
+                            if image is not None:
+                                updates["image"] = image
+                                raw["image_source"] = image.source
+                                raw["image_bounds"] = {
+                                    "x": image_bounds.x,
+                                    "y": image_bounds.y,
+                                    "width": image_bounds.width,
+                                    "height": image_bounds.height,
+                                }
+                        if updates:
+                            updates["raw"] = raw
+                            item = replace(item, **updates)
+                        captured.append(item)
+                    messages = captured
                 except Exception as exc:
                     if self.uia_sender and needs_direction:
                         raise RuntimeError(
                             "sender enrichment failed; verify the requested optional "
                             "dependencies and desktop screen-capture permission"
                         ) from exc
-            if self.uia_sender and active_type is ChatType.GROUP and any(
+            if self.uia_sender and enrich_senders and active_type is ChatType.GROUP and any(
                 item.sender is None and item.direction is Direction.INCOMING
                 for item in messages
             ):
@@ -237,6 +286,7 @@ class WeChatClient:
                         message_list=message_list,
                         main_window=root,
                         expected_chat=active_chat,
+                        limit=sender_limit,
                     )
                 except Exception as exc:
                     raise RuntimeError(
@@ -274,12 +324,13 @@ class WeChatClient:
                 point = self._visible_center(row, sessions)
                 if point is None:
                     continue
+                previous_title = self._infer_chat_title(root)
                 self._ensure_input().click(*point)
                 deadline = time.monotonic() + 2.0
                 while time.monotonic() < deadline:
                     if find_message_list(root, self.profile) and find_editor(root, self.profile):
                         title = self._infer_chat_title(root)
-                        if title:
+                        if title and title != previous_title:
                             title = re.sub(r"\s*[（(]\d+[）)]\s*$", "", title).strip()
                             if title and title not in discovered:
                                 discovered.append(title)
@@ -289,6 +340,197 @@ class WeChatClient:
                     self._sleep(0.1)
             return discovered
 
+    def visible_chat_name(self) -> str | None:
+        """Return the currently open chat title without emitting any input."""
+
+        with self._lock:
+            root = self._ensure_root()
+            if not find_message_list(root, self.profile) or not find_editor(root, self.profile):
+                return None
+            title = self._infer_chat_title(root)
+            if title:
+                title = re.sub(r"\s*[（(]\d+[）)]\s*$", "", title).strip()
+                if title:
+                    self._chat = title
+                    return title
+            return None
+
+    def enrich_visible_senders(
+        self,
+        messages: Iterable[Message],
+        *,
+        chat: str | None = None,
+    ) -> list[Message]:
+        """Read profile cards for the supplied visible group-message rows.
+
+        The service passes only messages that were newly observed in its
+        current poll (or one historical backlog row), so a burst is completed
+        without reopening every old sender card in the viewport.
+        """
+
+        values = list(messages)
+        if not self.uia_sender or not values:
+            return values
+        with self._lock:
+            root = self._ensure_root()
+            message_list = find_message_list(root, self.profile)
+            if message_list is None:
+                raise ControlNotFound("chat message list was not found")
+            active_chat = chat or self._chat or self._infer_chat_title(root) or "<current>"
+            enriched = self._enrich_uia_senders(
+                values,
+                message_list=message_list,
+                main_window=root,
+                expected_chat=active_chat,
+            )
+            self._remember_visual(enriched)
+            return enriched
+
+    def extract_visible_image(self, message: Message, *, chat: str | None = None) -> Message:
+        """Upgrade a visible image bubble using WeChat's viewer and Ctrl+C.
+
+        The click and shortcut are ordinary visible input. The viewer must be
+        exposed as WeChat's ``图片和视频`` top-level window, and it must close
+        back to the expected chat before this client permits more input.
+        """
+
+        if message.type is not MessageType.IMAGE:
+            raise ValueError("message must be an image")
+        with self._lock:
+            expected_chat = chat or message.chat
+            if expected_chat:
+                self.open_chat(expected_chat, chat_type=message.chat_type)
+            root = self._ensure_root()
+            self._assert_clean_surface(root, expected_chat=expected_chat)
+            raw_bounds = message.raw.get("image_bounds")
+            if not isinstance(raw_bounds, dict):
+                raise ControlNotFound("the visible image bubble has no safe pixel bounds")
+            try:
+                bounds = {
+                    key: int(raw_bounds[key]) for key in ("x", "y", "width", "height")
+                }
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ControlNotFound("the visible image bubble bounds are invalid") from exc
+            if bounds["width"] <= 0 or bounds["height"] <= 0:
+                raise ControlNotFound("the visible image bubble bounds are empty")
+            if message.bounds and bounds["width"] >= message.bounds.width * 0.85:
+                raise ControlNotFound(
+                    "the image locator only found the virtual row; refusing an ambiguous click"
+                )
+            point = (
+                bounds["x"] + bounds["width"] // 2,
+                bounds["y"] + bounds["height"] // 2,
+            )
+            input_backend = self._ensure_input()
+            clipboard = self._ensure_clipboard()
+            if not isinstance(input_backend, X11Input) or not isinstance(clipboard, X11Clipboard):
+                raise ControlNotFound("viewer image extraction currently requires X11/Xvfb")
+
+            image = None
+            viewer_window: int | None = None
+            try:
+                with clipboard.preserved():
+                    clipboard.clear()
+                    input_backend.click(*point, allow_wechat_window_change=True)
+                    viewer = self._wait_for_image_viewer(root)
+                    if viewer is None:
+                        raise ControlNotFound("WeChat image viewer did not open")
+                    viewer_window = input_backend.active_window()
+                    if (
+                        viewer_window is None
+                        or viewer_window == input_backend.find_wechat_window()
+                        or not input_backend.is_active_wechat_window()
+                    ):
+                        raise ControlNotFound("the image viewer is not the active WeChat window")
+                    input_backend.shortcut_active_wechat("ctrl", "c")
+                    deadline = time.monotonic() + 2.5
+                    while time.monotonic() < deadline:
+                        image = clipboard.read_image()
+                        if image is not None:
+                            break
+                        self._sleep(0.08)
+                    if image is None:
+                        raise ControlNotFound("WeChat image viewer did not copy an image")
+            finally:
+                self._close_image_viewer(
+                    root, expected_chat=expected_chat, viewer_window=viewer_window
+                )
+            return replace(
+                message,
+                image=image,
+                raw={**message.raw, "image_source": "viewer_clipboard"},
+            )
+
+    def _wait_for_image_viewer(self, main_window: Node) -> Node | None:
+        deadline = time.monotonic() + 2.5
+        while time.monotonic() < deadline:
+            extras = [
+                window for window in self.accessibility.windows()
+                if window.identity != main_window.identity
+            ]
+            if len(extras) == 1 and extras[0].name.strip() in {"图片和视频", "Images and Videos"}:
+                return extras[0]
+            if extras:
+                return None
+            self._sleep(0.06)
+        return None
+
+    def _close_image_viewer(
+        self,
+        main_window: Node,
+        *,
+        expected_chat: str,
+        viewer_window: int | None = None,
+    ) -> None:
+        # Ctrl+C can briefly expose a copy-confirmation surface alongside the
+        # viewer. Wait for that framework-triggered surface to disappear; do
+        # not treat an arbitrary second window as safe to dismiss.
+        extras = []
+        for _poll in range(50):
+            extras = [
+                window for window in self.accessibility.windows()
+                if window.identity != main_window.identity
+            ]
+            if not extras or (
+                len(extras) == 1
+                and extras[0].name.strip() in {"图片和视频", "Images and Videos"}
+            ):
+                break
+            self._sleep(0.06)
+        if extras:
+            recognized = any(
+                window.name.strip() in {"图片和视频", "Images and Videos"}
+                for window in extras
+            )
+            input_backend = self._ensure_input()
+            active_matches = (
+                isinstance(input_backend, X11Input)
+                and viewer_window is not None
+                and input_backend.active_window() == viewer_window
+            )
+            if recognized and active_matches:
+                for _attempt in range(2):
+                    input_backend.shortcut_active_wechat("esc")
+                    for _poll in range(50):
+                        extras = [
+                            window for window in self.accessibility.windows()
+                            if window.identity != main_window.identity
+                        ]
+                        if not extras:
+                            break
+                        self._sleep(0.06)
+                    if not extras:
+                        break
+        extras = [
+            window for window in self.accessibility.windows()
+            if window.identity != main_window.identity
+        ]
+        if extras or not self._is_chat_open(main_window, expected_chat):
+            self._interaction_blocked = True
+            raise ControlNotFound(
+                "image viewer did not close cleanly or the active chat changed; input locked"
+            )
+
     def send_text(
         self,
         chat: str,
@@ -297,7 +539,7 @@ class WeChatClient:
         chat_type: ChatType | str = ChatType.UNKNOWN,
         mentions: Iterable[str] = (),
         verify: bool = True,
-        verify_timeout: float = 2.5,
+        verify_timeout: float = 1.2,
     ) -> SendReceipt:
         """Send text through visible UI, optionally creating real rich @ mentions."""
 
@@ -307,9 +549,15 @@ class WeChatClient:
             raise ValueError("mentions require chat_type=ChatType.GROUP")
         display_text = self._display_text(text, mention_names)
         self._limiter.validate_text(display_text)
+        timings: dict[str, float] = {}
+        started = time.monotonic()
         with self._lock:
+            phase_started = time.monotonic()
             self._limiter.acquire(chat)
+            timings["rate_limit_s"] = time.monotonic() - phase_started
+            phase_started = time.monotonic()
             self.open_chat(chat, chat_type=chat_type)
+            timings["open_chat_s"] = time.monotonic() - phase_started
             root = self._ensure_root()
             editor = find_editor(root, self.profile)
             if editor is None or editor.bounds is None:
@@ -321,6 +569,7 @@ class WeChatClient:
                     "the chat editor already contains a draft; refusing to overwrite or append to it"
                 )
             input_backend = self._ensure_input()
+            phase_started = time.monotonic()
             input_backend.click(*editor.bounds.center)
             self._sleep(self.safety.action_delay)
             try:
@@ -335,6 +584,7 @@ class WeChatClient:
                 sent_at = datetime.now().astimezone()
                 self._known_outgoing.append((chat, display_text, time.monotonic() + 120.0))
                 self._sleep(self.safety.paste_settle_delay)
+                timings["input_to_enter_s"] = time.monotonic() - phase_started
             except Exception:
                 # Mention/search popups must be gone before the editor is
                 # touched again. If cleanup cannot be proven, lock this
@@ -343,10 +593,14 @@ class WeChatClient:
                 raise
 
             matched: Message | None = None
+            phase_started = time.monotonic()
             if verify:
                 deadline = time.monotonic() + verify_timeout
                 while time.monotonic() < deadline:
-                    messages = self.get_visible_messages()
+                    # Delivery verification must stay on the fast path. Group
+                    # sender profile cards are best-effort background reads and
+                    # must never delay an already-entered outgoing message.
+                    messages = self.get_visible_messages(enrich_senders=False)
                     matched = next(
                         (
                             item for item in reversed(messages)
@@ -359,6 +613,8 @@ class WeChatClient:
                     if matched:
                         break
                     self._sleep(0.18)
+            timings["verify_s"] = time.monotonic() - phase_started
+            timings["total_s"] = time.monotonic() - started
             return SendReceipt(
                 chat=chat,
                 content=display_text,
@@ -366,6 +622,7 @@ class WeChatClient:
                 verified=matched is not None,
                 matched_message_id=matched.id if matched else None,
                 mentions=mention_names,
+                timings=timings,
             )
 
     def listen(
@@ -478,16 +735,30 @@ class WeChatClient:
         message_list: Node,
         main_window: Node,
         expected_chat: str,
+        limit: int | None = None,
     ) -> list[Message]:
         result: list[Message] = []
+        attempted = 0
         for item in messages:
             if (
                 item.sender is not None
+                or item.chat_type is not ChatType.GROUP
                 or item.direction is not Direction.INCOMING
                 or item.bounds is None
+                or (limit is not None and attempted >= limit)
             ):
                 result.append(item)
                 continue
+            # Direction inference can be imperfect on Qt virtual rows. Never
+            # open a profile from a bubble geometrically on the outgoing half.
+            if (
+                message_list.bounds is not None
+                and item.bounds.x + item.bounds.width / 2
+                >= message_list.bounds.x + message_list.bounds.width * 0.58
+            ):
+                result.append(item)
+                continue
+            attempted += 1
             sender = self._read_profile_sender(
                 item.bounds,
                 message_list=message_list,
@@ -516,8 +787,13 @@ class WeChatClient:
         clip = message_list.bounds
         if clip is None:
             return None
-        x = row_bounds.x + min(44, max(20, row_bounds.width // 12))
-        y = row_bounds.y + min(30, max(16, row_bounds.height // 3))
+        # Qt exposes the whole virtual row, not the avatar itself. In current
+        # Linux WeChat the 36-40 px avatar begins roughly 18 px from the row's
+        # left edge and 8 px from its top edge. Use a conservative interior
+        # point. The former +56/+40 target was then scaled against the X11
+        # outer window and landed to the right/below the avatar on Xvfb.
+        x = row_bounds.x + min(36, max(24, row_bounds.width // 18))
+        y = row_bounds.y + min(26, max(18, row_bounds.height // 3))
         if not (clip.x <= x < clip.right and clip.y <= y < clip.bottom):
             return None
         known_windows = {window.identity for window in self.accessibility.windows()}
@@ -587,7 +863,22 @@ class WeChatClient:
             return
         input_backend = self._ensure_input()
         for _attempt in range(2):
-            input_backend.press("esc")
+            # Profile cards and media viewers are separate WeChat X11
+            # top-levels. ``press`` deliberately focuses the cached main
+            # window first, which would send Escape to the wrong surface and
+            # leave the transient open. When the backend can prove that the
+            # currently active top-level still belongs to WeChat, dismiss the
+            # active transient in place instead.
+            press_active = getattr(input_backend, "shortcut_active_wechat", None)
+            is_active_wechat = getattr(input_backend, "is_active_wechat_window", None)
+            if (
+                callable(press_active)
+                and callable(is_active_wechat)
+                and is_active_wechat()
+            ):
+                press_active("esc")
+            else:
+                input_backend.press("esc")
             for _poll in range(20):
                 extras = [
                     window for window in self.accessibility.windows()
@@ -765,6 +1056,13 @@ class WeChatClient:
             if node.role not in {"label", "text", "heading"}:
                 continue
             if node.name.casefold() in {"messages", "消息", "send", "发送"}:
+                continue
+            # Group headers expose the member count as a separate, very short
+            # label next to the real title (for example ``(21)``). Choosing
+            # the shortest top label would otherwise mistake that count for
+            # the active chat name and disable unread mode's visible-chat
+            # fallback when the current conversation receives a message.
+            if re.fullmatch(r"\s*[（(]\d+[）)]\s*", node.name):
                 continue
             if bounds.y < root_bounds.y + root_bounds.height * 0.25 and bounds.x > root_bounds.x + 180:
                 candidates.append((len(node.name), node.name))

@@ -6,7 +6,7 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Iterable
 
-from .accessibility import Node, attr_blob, related_nodes
+from .accessibility import Node, attr_blob, related_nodes, walk
 from .models import ChatType, Direction, Message, MessageType, Rect
 from .selectors import text_values, visible_message_nodes
 
@@ -68,11 +68,12 @@ class MessageParser:
         timestamp: datetime | None = None,
     ) -> Message | None:
         values = text_values(node)
-        content = self._content(node, values)
+        image_bounds = self._image_bounds(node)
+        content = self._content(node, values, image_bounds=image_bounds)
         if not content:
             return None
         direction = self._direction(node, container, values, content)
-        message_type = self._message_type(node, content, direction)
+        message_type = self._message_type(node, content, direction, image_bounds=image_bounds)
         sender = self._sender(node, values, content, direction, chat_type)
         if chat_type is ChatType.GROUP and direction is not Direction.OUTGOING and sender is None:
             prefix_sender, payload = self._split_group_prefix(content)
@@ -99,13 +100,31 @@ class MessageParser:
             timestamp=timestamp,
             chat_type=chat_type,
             is_at_me=is_at_me,
-            bounds=self._visual_bounds(node, values, content),
+            # Keep the whole row as the interaction bound. Group-sender
+            # enrichment uses its left edge to click the avatar; using the
+            # picture rectangle here would open the image viewer instead.
+            bounds=(
+                node.bounds
+                if image_bounds is not None
+                else self._visual_bounds(node, values, content)
+            ),
             raw={
                 "role": node.role,
                 "name": node.name,
                 "description": node.description,
                 "attributes": dict(node.attributes),
                 "texts": [value for value, _child in values],
+                **(
+                    {
+                        "image_bounds": {
+                            "x": image_bounds.x,
+                            "y": image_bounds.y,
+                            "width": image_bounds.width,
+                            "height": image_bounds.height,
+                        }
+                    }
+                    if image_bounds else {}
+                ),
             },
         )
 
@@ -129,7 +148,13 @@ class MessageParser:
     def _primary_text(node: Node) -> str:
         return (node.name or node.description or "").strip()
 
-    def _content(self, node: Node, values: list[tuple[str, Node]]) -> str:
+    def _content(
+        self,
+        node: Node,
+        values: list[tuple[str, Node]],
+        *,
+        image_bounds: Rect | None = None,
+    ) -> str:
         for key in ("message", "content", "text", "value"):
             value = node.attributes.get(key, "").strip()
             if value:
@@ -142,7 +167,37 @@ class MessageParser:
             if not self._looks_generic(value) and not self._looks_like_time(value)
             and child.role not in {"image", "icon"}
         ]
-        return max(candidates, key=len, default="")
+        content = max(candidates, key=len, default="")
+        return content or ("[图片]" if image_bounds is not None else "")
+
+    @staticmethod
+    def _image_bounds(node: Node) -> Rect | None:
+        """Find a rendered image body while excluding small avatar controls."""
+
+        candidates: list[tuple[int, Rect]] = []
+        for child, depth in walk(node, max_depth=5):
+            bounds = child.bounds
+            if bounds is None or child.role not in {"image", "icon", "canvas"}:
+                continue
+            blob = f"{attr_blob(child)} {child.name} {child.description}".casefold()
+            if any(marker in blob for marker in ("avatar", "head", "头像")):
+                continue
+            # WeChat avatars are normally 32–44 px squares. A message image is
+            # materially larger in at least one dimension.
+            if bounds.width < 48 or bounds.height < 48:
+                continue
+            area = bounds.width * bounds.height
+            candidates.append((area - depth, bounds))
+        if candidates:
+            return max(candidates, key=lambda item: item[0])[1]
+
+        blob = f"{attr_blob(node)} {node.name} {node.description}".casefold()
+        if (
+            node.name.strip().casefold() in {"图片", "image", "photo"}
+            or any(marker in blob for marker in ("image_message", "图片消息", "[图片]"))
+        ):
+            return node.bounds
+        return None
 
     def _sender(
         self,
@@ -165,10 +220,15 @@ class MessageParser:
         if relation_sender:
             return relation_sender
 
+        content_key = self._normalized_text(content)
         candidates: list[tuple[int, str]] = []
         message_bounds = node.bounds
         for value, child in values:
-            if value == content or self._looks_generic(value) or self._looks_like_time(value):
+            if (
+                self._normalized_text(value) == content_key
+                or self._looks_generic(value)
+                or self._looks_like_time(value)
+            ):
                 continue
             if len(value) > 64:
                 continue
@@ -190,6 +250,7 @@ class MessageParser:
 
     def _sender_from_relations(self, node: Node, content: str) -> str | None:
         candidates: list[tuple[int, str]] = []
+        content_key = self._normalized_text(content)
         for relation_name, targets in related_nodes(node).items():
             relation_score = 80 if any(
                 marker in relation_name
@@ -198,7 +259,7 @@ class MessageParser:
             for target in targets:
                 for value, child in text_values(target, max_depth=2):
                     if (
-                        value == content
+                        self._normalized_text(value) == content_key
                         or self._looks_generic(value)
                         or self._looks_like_time(value)
                         or len(value) > 64
@@ -209,6 +270,10 @@ class MessageParser:
                         score += 20
                     candidates.append((score, value))
         return max(candidates, default=(0, None), key=lambda item: item[0])[1]
+
+    @staticmethod
+    def _normalized_text(value: str) -> str:
+        return " ".join(value.replace("\u2005", " ").replace("\xa0", " ").split()).casefold()
 
     def _direction(
         self,
@@ -243,21 +308,29 @@ class MessageParser:
         return node.bounds
 
     @staticmethod
-    def _message_type(node: Node, content: str, direction: Direction) -> MessageType:
+    def _message_type(
+        node: Node,
+        content: str,
+        direction: Direction,
+        *,
+        image_bounds: Rect | None = None,
+    ) -> MessageType:
         blob = f"{attr_blob(node)} {content}".casefold()
         if direction is Direction.SYSTEM:
             return MessageType.SYSTEM
         mapping = (
-            (MessageType.IMAGE, ("[图片]", "image_message", "图片消息")),
             (MessageType.FILE, ("[文件]", "file_message", "文件消息")),
             (MessageType.VOICE, ("[语音]", "voice_message", "语音消息")),
             (MessageType.VIDEO, ("[视频]", "video_message", "视频消息")),
             (MessageType.STICKER, ("[动画表情]", "sticker", "emoji_message")),
             (MessageType.LINK, ("link_message", "链接消息")),
+            (MessageType.IMAGE, ("[图片]", "image_message", "图片消息")),
         )
         for message_type, markers in mapping:
             if any(marker.casefold() in blob for marker in markers):
                 return message_type
+        if image_bounds is not None:
+            return MessageType.IMAGE
         return MessageType.TEXT
 
     @staticmethod
@@ -274,7 +347,15 @@ class MessageParser:
         if not match:
             return None, value
         sender, content = match.group(1).strip(), match.group(2).strip()
-        if not sender or not content or sender.casefold() in _GENERIC:
+        # Bracketed application metadata such as ``[conv: 12ab34cd]`` is
+        # message content, not a group sender prefix. Treating ``[conv`` as a
+        # sender mutates the outgoing text and defeats pending-send matching.
+        if (
+            not sender
+            or not content
+            or sender.casefold() in _GENERIC
+            or sender.startswith(("[", "(", "{", "<"))
+        ):
             return None, value
         return sender, content
 

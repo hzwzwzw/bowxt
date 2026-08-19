@@ -2,7 +2,7 @@ name: bowxt
 
 services:
   desktop:
-    image: bowxt:0.3.0
+    image: bowxt:0.4.0
     build:
       context: .
       dockerfile: Dockerfile
@@ -16,8 +16,11 @@ services:
       VNC_RESOLUTION: "1280x900"
       VNC_DEPTH: "24"
       VNC_SCOPE: "${VNC_SCOPE:-window}"
-      BOWXT_POLL_GAP: "${BOWXT_POLL_GAP:-2.0}"
-      BOWXT_UIA_SENDER: "${BOWXT_UIA_SENDER:-0}"
+      BOWXT_POLL_GAP: "${BOWXT_POLL_GAP:-1.5}"
+      BOWXT_ACTION_DELAY: "${BOWXT_ACTION_DELAY:-0.12}"
+      BOWXT_SYNC_MODE: "${BOWXT_SYNC_MODE:-polling}"
+      BOWXT_UIA_SENDER: "${BOWXT_UIA_SENDER:-1}"
+      BOWXT_MY_NAMES: "${BOWXT_MY_NAMES:-}"
       TZ: Asia/Shanghai
     ports:
       - "127.0.0.1:${NOVNC_PORT:-6080}:6080"

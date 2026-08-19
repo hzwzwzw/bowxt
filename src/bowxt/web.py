@@ -9,8 +9,9 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
+from .errors import ServicePaused
 from .models import ChatType
 from .service import BowxtService
 
@@ -43,6 +44,44 @@ class BowxtRequestHandler(BaseHTTPRequestHandler):
                 {"chats": [chat.as_dict() for chat in self.server.service.store.list_chats()]},
             )
             return
+        if parsed.path == "/api/messages":
+            query = parse_qs(parsed.query)
+            after = int(query.get("after", ["0"])[0])
+            limit = int(query.get("limit", ["200"])[0])
+            if query.get("recent", ["0"])[0] == "1":
+                messages = self.server.service.store.latest_messages(limit=limit)
+            else:
+                messages = self.server.service.store.messages_after(after, limit=limit)
+            self._json(HTTPStatus.OK, {"messages": [item.as_dict() for item in messages]})
+            return
+        message_match = re.fullmatch(r"/api/messages/(\d+)", parsed.path)
+        if message_match:
+            try:
+                message = self.server.service.store.get_message(int(message_match.group(1)))
+            except KeyError as exc:
+                self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            self._json(HTTPStatus.OK, {"message": message.as_dict()})
+            return
+        if parsed.path == "/api/agent/logs":
+            query = parse_qs(parsed.query)
+            after = int(query.get("after", ["0"])[0])
+            before_value = query.get("before", [None])[0]
+            before = int(before_value) if before_value is not None else None
+            limit = int(query.get("limit", ["200"])[0])
+            recent = query.get("recent", ["0"])[0] == "1"
+            logs = self.server.service.store.get_agent_logs(
+                after_seq=after,
+                before_seq=before,
+                limit=limit,
+                recent=recent,
+            )
+            self._json(HTTPStatus.OK, {"logs": [item.as_dict() for item in logs]})
+            return
+        image_match = re.fullmatch(r"/api/messages/(\d+)/image", parsed.path)
+        if image_match:
+            self._image(int(image_match.group(1)))
+            return
         match = re.fullmatch(r"/api/chats/(\d+)/messages", parsed.path)
         if match:
             query = parse_qs(parsed.query)
@@ -50,7 +89,12 @@ class BowxtRequestHandler(BaseHTTPRequestHandler):
             limit = int(query.get("limit", ["200"])[0])
             try:
                 self.server.service.store.get_chat(int(match.group(1)))
-                if query.get("recent", ["0"])[0] == "1":
+                before_value = query.get("before", [None])[0]
+                if before_value is not None:
+                    messages = self.server.service.store.messages_before(
+                        int(match.group(1)), int(before_value), limit=limit
+                    )
+                elif query.get("recent", ["0"])[0] == "1":
                     messages = self.server.service.store.recent_messages(
                         int(match.group(1)), limit=limit
                     )
@@ -81,12 +125,67 @@ class BowxtRequestHandler(BaseHTTPRequestHandler):
                 return
             match = re.fullmatch(r"/api/chats/(\d+)/messages", parsed.path)
             if match:
-                message = self.server.service.send_text(
+                message = self.server.service.enqueue_text(
                     int(match.group(1)),
                     str(body.get("text", "")),
                     mentions=tuple(body.get("mentions") or ()),
+                    client_id=body.get("client_id"),
                 )
-                self._json(HTTPStatus.CREATED, {"message": message.as_dict()})
+                self._json(HTTPStatus.ACCEPTED, {"message": message.as_dict()})
+                return
+            claim_match = re.fullmatch(r"/api/agents/([^/]+)/claim", parsed.path)
+            if claim_match:
+                chat_ids = body.get("chat_ids", [])
+                if not isinstance(chat_ids, list):
+                    raise ValueError("chat_ids must be an array")
+                for flag in ("require_sender", "require_at_me", "replay_existing"):
+                    if flag in body and not isinstance(body[flag], bool):
+                        raise ValueError(f"{flag} must be a boolean")
+                deliveries = self.server.service.claim_agent_messages(
+                    unquote(claim_match.group(1)),
+                    chat_ids=(int(item) for item in chat_ids),
+                    limit=int(body.get("limit", 8)),
+                    lease_seconds=float(body.get("lease_seconds", 60.0)),
+                    timeout=float(body.get("timeout", 0.0)),
+                    require_sender=bool(body.get("require_sender", False)),
+                    require_at_me=bool(body.get("require_at_me", False)),
+                    replay_existing=bool(body.get("replay_existing", False)),
+                )
+                self._json(
+                    HTTPStatus.OK,
+                    {"deliveries": [item.as_dict() for item in deliveries]},
+                )
+                return
+            delivery_match = re.fullmatch(
+                r"/api/agents/([^/]+)/deliveries/(\d+)/(ack|nack)", parsed.path
+            )
+            if delivery_match:
+                consumer = unquote(delivery_match.group(1))
+                message_seq = int(delivery_match.group(2))
+                lease_token = str(body.get("lease_token", ""))
+                if delivery_match.group(3) == "ack":
+                    self.server.service.ack_agent_message(
+                        consumer, message_seq, lease_token
+                    )
+                else:
+                    self.server.service.nack_agent_message(
+                        consumer,
+                        message_seq,
+                        lease_token,
+                        error=str(body.get("error", "")),
+                        retry_delay=float(body.get("retry_delay", 5.0)),
+                    )
+                self._json(HTTPStatus.OK, {"ok": True})
+                return
+            if parsed.path == "/api/agent/logs":
+                log = self.server.service.log_agent(
+                    str(body.get("agent", "")),
+                    str(body.get("level", "info")),
+                    str(body.get("message", "")),
+                    event=str(body.get("event", "log")),
+                    context=body.get("context") or {},
+                )
+                self._json(HTTPStatus.CREATED, {"log": log.as_dict()})
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
         except KeyError as exc:
@@ -95,11 +194,31 @@ class BowxtRequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except TimeoutError as exc:
             self._json(HTTPStatus.GATEWAY_TIMEOUT, {"error": str(exc)})
+        except ServicePaused as exc:
+            self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
         except Exception as exc:
             self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
 
     def do_PATCH(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/control":
+            try:
+                body = self._read_json()
+                unknown = set(body) - {"mode", "paused", "poll_gap", "action_delay"}
+                if unknown or not body:
+                    raise ValueError(
+                        "control accepts only mode, paused, poll_gap and action_delay"
+                    )
+                status = self.server.service.configure(
+                    paused=body.get("paused") if "paused" in body else None,
+                    mode=body.get("mode") if "mode" in body else None,
+                    poll_gap=body.get("poll_gap") if "poll_gap" in body else None,
+                    action_delay=body.get("action_delay") if "action_delay" in body else None,
+                )
+                self._json(HTTPStatus.OK, status)
+            except (ValueError, TypeError) as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
         match = re.fullmatch(r"/api/chats/(\d+)", parsed.path)
         if not match:
             self._json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
@@ -169,6 +288,26 @@ class BowxtRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Security-Policy", "default-src 'self'; connect-src 'self'; style-src 'self'")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _image(self, seq: int) -> None:
+        try:
+            path, mime_type, digest = self.server.service.store.image_asset(seq)
+            data = path.read_bytes()
+        except (KeyError, FileNotFoundError):
+            self._json(HTTPStatus.NOT_FOUND, {"error": "image not found"})
+            return
+        except (OSError, ValueError) as exc:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", mime_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "private, max-age=31536000, immutable")
+        self.send_header("ETag", f'"{digest}"')
+        self.send_header("Content-Disposition", f'inline; filename="{digest}.png"')
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(data)
 

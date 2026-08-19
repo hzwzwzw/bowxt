@@ -2,8 +2,23 @@
 set -euo pipefail
 
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# Keep machine/account-specific settings reproducible without committing or
+# copying them into the image. Existing environment variables win, so callers
+# can still make a one-off override.
+if [[ -f "$project_dir/.env" ]]; then
+  while IFS= read -r env_line || [[ -n "$env_line" ]]; do
+    [[ "$env_line" =~ ^[[:space:]]*($|#) ]] && continue
+    env_key=${env_line%%=*}
+    env_value=${env_line#*=}
+    [[ "$env_key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    if [[ ! -v "$env_key" ]]; then
+      printf -v "$env_key" '%s' "$env_value"
+      export "$env_key"
+    fi
+  done < "$project_dir/.env"
+fi
 container_name=bowxt
-image_name=bowxt:0.3.0
+image_name=bowxt:0.4.0
 volume_name=bowxt-home
 context_dir=$project_dir
 vnc_scope=${VNC_SCOPE:-window}
@@ -53,10 +68,16 @@ case "${1:-help}" in
       desired_image=$(docker_run image inspect -f '{{.Id}}' "$image_name")
       current_scope=$(docker_run inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container_name" | sed -n 's/^VNC_SCOPE=//p')
       current_poll=$(docker_run inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container_name" | sed -n 's/^BOWXT_POLL_GAP=//p')
+      current_action=$(docker_run inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container_name" | sed -n 's/^BOWXT_ACTION_DELAY=//p')
+      current_mode=$(docker_run inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container_name" | sed -n 's/^BOWXT_SYNC_MODE=//p')
       current_sender=$(docker_run inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container_name" | sed -n 's/^BOWXT_UIA_SENDER=//p')
+      current_my_names=$(docker_run inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container_name" | sed -n 's/^BOWXT_MY_NAMES=//p')
       if [[ "$current_image" != "$desired_image" || "$current_scope" != "$vnc_scope" \
-        || "$current_poll" != "${BOWXT_POLL_GAP:-2.0}" \
-        || "$current_sender" != "${BOWXT_UIA_SENDER:-0}" ]]; then
+        || "$current_poll" != "${BOWXT_POLL_GAP:-1.5}" \
+        || "$current_action" != "${BOWXT_ACTION_DELAY:-0.12}" \
+        || "$current_mode" != "${BOWXT_SYNC_MODE:-polling}" \
+        || "$current_sender" != "${BOWXT_UIA_SENDER:-1}" \
+        || "$current_my_names" != "${BOWXT_MY_NAMES:-}" ]]; then
         echo "replacing container to apply image/display mode (login volume is preserved)"
         docker_run rm -f "$container_name" >/dev/null
       else
@@ -82,8 +103,11 @@ case "${1:-help}" in
         --env VNC_RESOLUTION=1280x900 \
         --env VNC_DEPTH=24 \
         --env VNC_SCOPE="$vnc_scope" \
-        --env BOWXT_POLL_GAP="${BOWXT_POLL_GAP:-2.0}" \
-        --env BOWXT_UIA_SENDER="${BOWXT_UIA_SENDER:-0}" \
+        --env BOWXT_POLL_GAP="${BOWXT_POLL_GAP:-1.5}" \
+        --env BOWXT_ACTION_DELAY="${BOWXT_ACTION_DELAY:-0.12}" \
+        --env BOWXT_SYNC_MODE="${BOWXT_SYNC_MODE:-polling}" \
+        --env BOWXT_UIA_SENDER="${BOWXT_UIA_SENDER:-1}" \
+        --env BOWXT_MY_NAMES="${BOWXT_MY_NAMES:-}" \
         --env TZ=Asia/Shanghai \
         --publish "127.0.0.1:${NOVNC_PORT:-6080}:6080" \
         --publish "127.0.0.1:${VNC_PORT:-5900}:5900" \
@@ -93,14 +117,14 @@ case "${1:-help}" in
     fi
     wait_healthy
     echo "bowxt: http://127.0.0.1:${WEB_PORT:-8787}/"
-    echo "noVNC: http://127.0.0.1:${NOVNC_PORT:-6080}/vnc.html?autoconnect=1&resize=scale"
+    echo "noVNC: http://127.0.0.1:${NOVNC_PORT:-6080}/vnc.html?autoconnect=1&resize=scale&reconnect=1&reconnect_delay=1000"
     echo "VNC scope: $vnc_scope"
     ;;
   open)
     xdg-open "http://127.0.0.1:${WEB_PORT:-8787}/" >/dev/null 2>&1 &
     ;;
   vnc)
-    xdg-open "http://127.0.0.1:${NOVNC_PORT:-6080}/vnc.html?autoconnect=1&resize=scale" >/dev/null 2>&1 &
+    xdg-open "http://127.0.0.1:${NOVNC_PORT:-6080}/vnc.html?autoconnect=1&resize=scale&reconnect=1&reconnect_delay=1000" >/dev/null 2>&1 &
     ;;
   status)
     docker_run ps -a --filter "name=^/${container_name}$"
