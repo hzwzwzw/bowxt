@@ -2,7 +2,10 @@ import unittest
 from io import BytesIO
 from unittest.mock import patch
 
-from PIL import Image
+try:
+    from PIL import Image
+except ImportError:  # Optional ``vision`` dependency.
+    Image = None
 
 from bowxt.input import X11Clipboard, X11Input
 from bowxt.models import Rect
@@ -41,6 +44,7 @@ class X11InputMappingTests(unittest.TestCase):
 
 
 class X11ClipboardTests(unittest.TestCase):
+    @unittest.skipIf(Image is None, "Pillow is optional")
     def test_clipboard_png_is_validated_with_original_dimensions(self):
         output = BytesIO()
         Image.new("RGB", (1200, 2670), "green").save(output, format="PNG")
