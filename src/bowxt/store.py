@@ -45,6 +45,7 @@ class StoredMessage:
     chat: str
     chat_type: ChatType
     sender: str | None
+    sender_organization: str | None
     content: str
     message_type: str
     direction: str
@@ -100,6 +101,47 @@ class AgentLog:
         return asdict(self)
 
 
+@dataclass(frozen=True, slots=True)
+class AgentInstance:
+    id: str
+    plugin_id: str
+    name: str
+    config: dict[str, Any]
+    secrets: dict[str, str]
+    permissions: dict[str, Any]
+    autostart: bool
+    created_at: str
+    updated_at: str
+
+    def as_dict(self, *, include_secrets: bool = False) -> dict[str, Any]:
+        value = asdict(self)
+        if not include_secrets:
+            value["secrets"] = {
+                key: {"configured": bool(secret)} for key, secret in self.secrets.items()
+            }
+        return value
+
+
+@dataclass(frozen=True, slots=True)
+class AgentPanel:
+    agent: str
+    panel_id: str
+    title: str
+    document: dict[str, Any]
+    updated_at: str
+
+    def as_dict(self, *, include_document: bool = True) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "agent": self.agent,
+            "id": self.panel_id,
+            "title": self.title,
+            "updated_at": self.updated_at,
+        }
+        if include_document:
+            value["document"] = self.document
+        return value
+
+
 class SQLiteStore:
     """Small durable store shared by the UI worker and HTTP threads.
 
@@ -113,6 +155,10 @@ class SQLiteStore:
         self.image_dir = Path(self.path).parent / "images"
         self._schema_lock = threading.Lock()
         self._initialize()
+        try:
+            Path(self.path).chmod(0o600)
+        except OSError:
+            pass
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10.0)
@@ -152,6 +198,8 @@ class SQLiteStore:
                     message_id TEXT NOT NULL,
                     chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
                     sender TEXT,
+                    sender_organization TEXT,
+                    sender_profile_checked INTEGER NOT NULL DEFAULT 0,
                     content TEXT NOT NULL,
                     message_type TEXT NOT NULL,
                     direction TEXT NOT NULL,
@@ -197,7 +245,9 @@ class SQLiteStore:
                     consumer TEXT PRIMARY KEY,
                     start_seq INTEGER NOT NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    last_claim_chat_ids_json TEXT NOT NULL DEFAULT '[]',
+                    last_claim_at TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS agent_logs (
@@ -212,6 +262,30 @@ class SQLiteStore:
 
                 CREATE INDEX IF NOT EXISTS idx_agent_logs_created
                     ON agent_logs(created_at);
+
+                CREATE TABLE IF NOT EXISTS agent_instances (
+                    id TEXT PRIMARY KEY,
+                    plugin_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    config_json TEXT NOT NULL DEFAULT '{}',
+                    secrets_json TEXT NOT NULL DEFAULT '{}',
+                    permissions_json TEXT NOT NULL DEFAULT '{"read":{"mode":"all","chat_ids":[],"patterns":[]},"write":{"mode":"all","chat_ids":[],"patterns":[]}}',
+                    autostart INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_instances_name
+                    ON agent_instances(name);
+
+                CREATE TABLE IF NOT EXISTS agent_panels (
+                    agent TEXT NOT NULL REFERENCES agent_instances(id) ON DELETE CASCADE,
+                    panel_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    document_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (agent, panel_id)
+                );
                 """
             )
             columns = {
@@ -226,6 +300,13 @@ class SQLiteStore:
                 db.execute("ALTER TABLE messages ADD COLUMN delivery_error TEXT")
             if "client_id" not in columns:
                 db.execute("ALTER TABLE messages ADD COLUMN client_id TEXT")
+            if "sender_organization" not in columns:
+                db.execute("ALTER TABLE messages ADD COLUMN sender_organization TEXT")
+            if "sender_profile_checked" not in columns:
+                db.execute(
+                    "ALTER TABLE messages ADD COLUMN "
+                    "sender_profile_checked INTEGER NOT NULL DEFAULT 0"
+                )
             image_columns = {
                 "image_path": "TEXT",
                 "image_mime_type": "TEXT",
@@ -237,6 +318,28 @@ class SQLiteStore:
             for name, sql_type in image_columns.items():
                 if name not in columns:
                     db.execute(f"ALTER TABLE messages ADD COLUMN {name} {sql_type}")
+            consumer_columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(agent_consumers)").fetchall()
+            }
+            if "last_claim_chat_ids_json" not in consumer_columns:
+                db.execute(
+                    "ALTER TABLE agent_consumers ADD COLUMN "
+                    "last_claim_chat_ids_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "last_claim_at" not in consumer_columns:
+                db.execute("ALTER TABLE agent_consumers ADD COLUMN last_claim_at TEXT")
+            instance_columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(agent_instances)").fetchall()
+            }
+            if "permissions_json" not in instance_columns:
+                db.execute(
+                    "ALTER TABLE agent_instances ADD COLUMN "
+                    "permissions_json TEXT NOT NULL DEFAULT "
+                    "'{\"read\":{\"mode\":\"all\",\"chat_ids\":[],\"patterns\":[]},"
+                    "\"write\":{\"mode\":\"all\",\"chat_ids\":[],\"patterns\":[]}}'"
+                )
             db.execute(
                 """CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_chat_client_id
                    ON messages(chat_id, client_id) WHERE client_id IS NOT NULL"""
@@ -265,6 +368,8 @@ class SQLiteStore:
                         ELSE excluded.chat_type
                     END,
                     source = CASE
+                        WHEN chats.source = 'simulation' THEN chats.source
+                        WHEN excluded.source = 'simulation' THEN excluded.source
                         WHEN chats.source = 'manual' THEN chats.source
                         ELSE excluded.source
                     END,
@@ -274,6 +379,35 @@ class SQLiteStore:
                 (clean_name, kind.value, source, now, now),
             )
             row = db.execute("SELECT * FROM chats WHERE name = ?", (clean_name,)).fetchone()
+        assert row is not None
+        return self._chat_from_row(row)
+
+    def create_simulated_chat(
+        self, name: str, chat_type: ChatType | str
+    ) -> StoredChat:
+        """Create a local-only chat that must never be opened in WeChat."""
+
+        clean_name = " ".join(str(name).split())
+        if not clean_name or len(clean_name) > 128:
+            raise ValueError("simulated chat name must be between 1 and 128 characters")
+        kind = ChatType(chat_type)
+        if kind not in {ChatType.CONTACT, ChatType.GROUP}:
+            raise ValueError("simulated chat type must be contact or group")
+        now = _utc_now()
+        try:
+            with self._database() as db:
+                cursor = db.execute(
+                    """
+                    INSERT INTO chats(name, chat_type, source, created_at, updated_at)
+                    VALUES (?, ?, 'simulation', ?, ?)
+                    """,
+                    (clean_name, kind.value, now, now),
+                )
+                row = db.execute(
+                    "SELECT * FROM chats WHERE id = ?", (int(cursor.lastrowid),)
+                ).fetchone()
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(f"chat name already exists: {clean_name}") from exc
         assert row is not None
         return self._chat_from_row(row)
 
@@ -312,11 +446,65 @@ class SQLiteStore:
             raise KeyError(f"unknown chat id {chat_id}")
         return self._chat_from_row(row)
 
+    def is_historical_quote_source(self, message: Message) -> bool:
+        """Identify an older quoted source exposed later by Qt virtualization.
+
+        Opening a quoted reply or restoring a virtualized viewport can expose
+        its older source row after newer messages. With neither a timestamp nor
+        a stable WeChat ID, appending that row would make old history look like
+        a newly arrived message. A previously observed quote gives us explicit
+        evidence that the standalone text predates that reply.
+        """
+
+        if (
+            message.direction is not Direction.INCOMING
+            or message.timestamp is not None
+            or not message.content.strip()
+            or "引用 " in message.content
+        ):
+            return False
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        with self._database() as db:
+            chat = db.execute("SELECT id FROM chats WHERE name = ?", (message.chat,)).fetchone()
+            if chat is None:
+                return False
+            known = db.execute(
+                "SELECT 1 FROM messages WHERE chat_id = ? AND message_id = ?",
+                (int(chat["id"]), message.id),
+            ).fetchone()
+            if known is not None:
+                return False
+            rows = db.execute(
+                """
+                SELECT content FROM messages
+                WHERE chat_id = ? AND direction = 'incoming' AND observed_at >= ?
+                  AND content LIKE '%引用 %的消息%'
+                ORDER BY seq DESC LIMIT 200
+                """,
+                (int(chat["id"]), cutoff),
+            ).fetchall()
+        expected = message.content.strip()
+        for row in rows:
+            quoted = self._quoted_source_text(str(row["content"]))
+            if quoted == expected:
+                return True
+        return False
+
+    @staticmethod
+    def _quoted_source_text(content: str) -> str | None:
+        match = re.search(
+            r"(?:^|\n)引用\s+[^\n:：]{1,80}\s+的消息\s*[:：]\s*(.+)\Z",
+            str(content).strip(),
+            re.DOTALL,
+        )
+        return match.group(1).strip() if match else None
+
     def save_message(self, message: Message) -> tuple[StoredMessage, bool]:
         chat = self.upsert_chat(message.chat, message.chat_type, source="observed")
         timestamp = message.timestamp.isoformat() if message.timestamp else None
         observed_at = _utc_now()
         raw = json.dumps(dict(message.raw), ensure_ascii=False, default=str)
+        sender_profile_checked = int(message.raw.get("sender_source") == "profile_uia")
         image_values = (None, None, None, None, None, None)
         replace_image = False
         replaced_image_path: str | None = None
@@ -461,16 +649,19 @@ class SQLiteStore:
                 cursor = db.execute(
                     """
                     INSERT INTO messages(
-                        message_id, chat_id, sender, content, message_type,
+                        message_id, chat_id, sender, sender_organization,
+                        sender_profile_checked, content, message_type,
                         direction, timestamp, observed_at, is_at_me, raw_json,
                         image_path, image_mime_type, image_width, image_height,
                         image_sha256, image_source
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         message.id,
                         chat.id,
                         message.sender,
+                        message.sender_organization,
+                        sender_profile_checked,
                         message.content,
                         message.type.value,
                         message.direction.value,
@@ -486,7 +677,9 @@ class SQLiteStore:
                 seq = int(existing["seq"])
                 db.execute(
                     """
-                    UPDATE messages SET sender = COALESCE(?, sender), content = ?,
+                    UPDATE messages SET sender = COALESCE(?, sender),
+                        sender_organization = COALESCE(?, sender_organization),
+                        sender_profile_checked = MAX(sender_profile_checked, ?), content = ?,
                         message_type = ?, direction = ?, timestamp = COALESCE(?, timestamp),
                         is_at_me = ?, raw_json = ?,
                         image_path = COALESCE(image_path, ?),
@@ -507,6 +700,8 @@ class SQLiteStore:
                     """,
                     (
                         message.sender,
+                        message.sender_organization,
+                        sender_profile_checked,
                         message.content,
                         message.type.value,
                         message.direction.value,
@@ -556,6 +751,18 @@ class SQLiteStore:
         if replaced_image_path:
             self._delete_image_if_unreferenced(replaced_image_path)
         return self._message_from_row(row), created
+
+    def sender_profile_checked(self, seq: int) -> bool:
+        """Return whether a verified profile card was read for this row."""
+
+        with self._database() as db:
+            row = db.execute(
+                "SELECT sender_profile_checked FROM messages WHERE seq = ?",
+                (int(seq),),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown message seq {seq}")
+        return bool(row["sender_profile_checked"])
 
     @staticmethod
     def _image_source_rank(source: str | None) -> int:
@@ -866,6 +1073,32 @@ class SQLiteStore:
             ).fetchall()
         return [self._message_from_row(row) for row in rows]
 
+    def message_history(
+        self,
+        chat_id: int,
+        *,
+        since: str,
+        until: str,
+        after_seq: int = 0,
+        limit: int = 1000,
+    ) -> list[StoredMessage]:
+        """Return one complete-time-window page in durable sequence order."""
+
+        bounded_limit = min(max(int(limit), 1), 1000)
+        with self._database() as db:
+            rows = db.execute(
+                """
+                SELECT m.*, c.name AS chat, c.chat_type AS chat_type
+                FROM messages m JOIN chats c ON c.id = m.chat_id
+                WHERE m.chat_id = ? AND m.seq > ?
+                  AND julianday(COALESCE(m.timestamp, m.observed_at)) >= julianday(?)
+                  AND julianday(COALESCE(m.timestamp, m.observed_at)) <= julianday(?)
+                ORDER BY m.seq ASC LIMIT ?
+                """,
+                (int(chat_id), int(after_seq), since, until, bounded_limit),
+            ).fetchall()
+        return [self._message_from_row(row) for row in rows]
+
     def get_message(self, seq: int) -> StoredMessage:
         with self._database() as db:
             row = db.execute(
@@ -890,6 +1123,7 @@ class SQLiteStore:
         require_sender: bool = False,
         require_at_me: bool = False,
         replay_existing: bool = False,
+        deny_all_chats: bool = False,
     ) -> list[AgentDelivery]:
         """Atomically lease incoming messages to one durable Agent consumer.
 
@@ -919,6 +1153,19 @@ class SQLiteStore:
                 """,
                 (name, initial_start, now_text, now_text),
             )
+            db.execute(
+                """
+                UPDATE agent_consumers
+                SET updated_at = ?, last_claim_at = ?, last_claim_chat_ids_json = ?
+                WHERE consumer = ?
+                """,
+                (
+                    now_text,
+                    now_text,
+                    json.dumps(list(selected_chat_ids), ensure_ascii=False),
+                    name,
+                ),
+            )
             consumer_row = db.execute(
                 "SELECT start_seq FROM agent_consumers WHERE consumer = ?", (name,)
             ).fetchone()
@@ -935,6 +1182,8 @@ class SQLiteStore:
                 placeholders = ",".join("?" for _ in selected_chat_ids)
                 chat_clause = f" AND m.chat_id IN ({placeholders})"
                 parameters.extend(selected_chat_ids)
+            elif deny_all_chats:
+                chat_clause = " AND 0"
             parameters.append(bounded_limit)
             rows = db.execute(
                 f"""
@@ -986,6 +1235,29 @@ class SQLiteStore:
                     attempt=attempt,
                 ))
         return deliveries
+
+    def get_agent_consumer_activity(self, consumer: str) -> dict[str, Any]:
+        name = self._validate_agent_name(consumer, field="consumer")
+        with self._database() as db:
+            row = db.execute(
+                """
+                SELECT last_claim_chat_ids_json, last_claim_at
+                FROM agent_consumers WHERE consumer = ?
+                """,
+                (name,),
+            ).fetchone()
+        if row is None:
+            return {"last_claim_chat_ids": [], "last_claim_at": None}
+        try:
+            chat_ids = json.loads(str(row["last_claim_chat_ids_json"] or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            chat_ids = []
+        return {
+            "last_claim_chat_ids": [int(item) for item in chat_ids]
+            if isinstance(chat_ids, list)
+            else [],
+            "last_claim_at": row["last_claim_at"],
+        }
 
     def ack_agent_message(self, consumer: str, message_seq: int, lease_token: str) -> None:
         name = self._validate_agent_name(consumer, field="consumer")
@@ -1072,25 +1344,261 @@ class SQLiteStore:
     def get_agent_logs(
         self,
         *,
+        agent: str | None = None,
         after_seq: int = 0,
         before_seq: int | None = None,
         limit: int = 200,
         recent: bool = False,
     ) -> list[AgentLog]:
         bounded_limit = min(max(int(limit), 1), 1000)
+        selected_agent = (
+            self._validate_agent_name(agent, field="agent") if agent is not None else None
+        )
+        agent_clause = "agent = ? AND " if selected_agent else ""
+        prefix: tuple[Any, ...] = (selected_agent,) if selected_agent else ()
         if recent:
-            query = "SELECT * FROM agent_logs ORDER BY seq DESC LIMIT ?"
-            parameters: tuple[Any, ...] = (bounded_limit,)
+            query = f"SELECT * FROM agent_logs WHERE {agent_clause}1 = 1 ORDER BY seq DESC LIMIT ?"
+            parameters: tuple[Any, ...] = prefix + (bounded_limit,)
         elif before_seq is not None:
-            query = "SELECT * FROM agent_logs WHERE seq < ? ORDER BY seq DESC LIMIT ?"
-            parameters = (int(before_seq), bounded_limit)
+            query = f"SELECT * FROM agent_logs WHERE {agent_clause}seq < ? ORDER BY seq DESC LIMIT ?"
+            parameters = prefix + (int(before_seq), bounded_limit)
         else:
-            query = "SELECT * FROM agent_logs WHERE seq > ? ORDER BY seq ASC LIMIT ?"
-            parameters = (int(after_seq), bounded_limit)
+            query = f"SELECT * FROM agent_logs WHERE {agent_clause}seq > ? ORDER BY seq ASC LIMIT ?"
+            parameters = prefix + (int(after_seq), bounded_limit)
         with self._database() as db:
             rows = db.execute(query, parameters).fetchall()
         values = [self._agent_log_from_row(row) for row in rows]
         return list(reversed(values)) if recent or before_seq is not None else values
+
+    def list_agent_instances(self) -> list[AgentInstance]:
+        with self._database() as db:
+            rows = db.execute(
+                "SELECT * FROM agent_instances ORDER BY created_at ASC"
+            ).fetchall()
+        return [self._agent_instance_from_row(row) for row in rows]
+
+    def get_agent_instance(self, instance_id: str) -> AgentInstance:
+        clean_id = self._validate_agent_name(instance_id, field="instance id")
+        with self._database() as db:
+            row = db.execute(
+                "SELECT * FROM agent_instances WHERE id = ?", (clean_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown agent instance {clean_id}")
+        return self._agent_instance_from_row(row)
+
+    def create_agent_instance(
+        self,
+        instance_id: str,
+        plugin_id: str,
+        name: str,
+        *,
+        config: dict[str, Any] | None = None,
+        secrets: dict[str, str] | None = None,
+        permissions: dict[str, Any] | None = None,
+        autostart: bool = False,
+    ) -> AgentInstance:
+        clean_id = self._validate_agent_name(instance_id, field="instance id")
+        clean_plugin = self._validate_agent_name(plugin_id, field="plugin id")
+        clean_name = " ".join(str(name).split())
+        if not clean_name or len(clean_name) > 80:
+            raise ValueError("agent name must be between 1 and 80 characters")
+        config_value = self._validate_json_object(config or {}, field="config")
+        secret_value = self._validate_secrets(secrets or {})
+        permission_value = self._validate_json_object(
+            permissions or self.default_agent_permissions(), field="permissions"
+        )
+        now = _utc_now()
+        with self._database() as db:
+            try:
+                db.execute(
+                    """
+                    INSERT INTO agent_instances(
+                        id, plugin_id, name, config_json, secrets_json, permissions_json, autostart,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        clean_id,
+                        clean_plugin,
+                        clean_name,
+                        json.dumps(config_value, ensure_ascii=False),
+                        json.dumps(secret_value, ensure_ascii=False),
+                        json.dumps(permission_value, ensure_ascii=False),
+                        int(bool(autostart)),
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("agent instance id or name already exists") from exc
+        return self.get_agent_instance(clean_id)
+
+    def update_agent_instance(
+        self,
+        instance_id: str,
+        *,
+        name: str | None = None,
+        config: dict[str, Any] | None = None,
+        secrets: dict[str, str | None] | None = None,
+        permissions: dict[str, Any] | None = None,
+        autostart: bool | None = None,
+    ) -> AgentInstance:
+        current = self.get_agent_instance(instance_id)
+        next_name = current.name if name is None else " ".join(str(name).split())
+        if not next_name or len(next_name) > 80:
+            raise ValueError("agent name must be between 1 and 80 characters")
+        next_config = current.config if config is None else self._validate_json_object(
+            config, field="config"
+        )
+        next_secrets = dict(current.secrets)
+        next_permissions = (
+            current.permissions
+            if permissions is None
+            else self._validate_json_object(permissions, field="permissions")
+        )
+        if secrets is not None:
+            if not isinstance(secrets, dict):
+                raise ValueError("secrets must be an object")
+            for key, value in secrets.items():
+                clean_key = self._validate_secret_key(key)
+                if value is None or value == "":
+                    next_secrets.pop(clean_key, None)
+                else:
+                    next_secrets[clean_key] = self._validate_secret_value(value)
+        next_autostart = current.autostart if autostart is None else bool(autostart)
+        with self._database() as db:
+            try:
+                db.execute(
+                    """
+                    UPDATE agent_instances
+                    SET name = ?, config_json = ?, secrets_json = ?, permissions_json = ?, autostart = ?,
+                        updated_at = ? WHERE id = ?
+                    """,
+                    (
+                        next_name,
+                        json.dumps(next_config, ensure_ascii=False),
+                        json.dumps(next_secrets, ensure_ascii=False),
+                        json.dumps(next_permissions, ensure_ascii=False),
+                        int(next_autostart),
+                        _utc_now(),
+                        current.id,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("agent instance name already exists") from exc
+        return self.get_agent_instance(current.id)
+
+    def delete_agent_instance(self, instance_id: str) -> None:
+        current = self.get_agent_instance(instance_id)
+        with self._database() as db:
+            db.execute("DELETE FROM agent_instances WHERE id = ?", (current.id,))
+
+    def upsert_agent_panel(
+        self,
+        agent: str,
+        panel_id: str,
+        title: str,
+        document: dict[str, Any],
+    ) -> AgentPanel:
+        clean_agent = self._validate_agent_name(agent, field="agent")
+        clean_panel_id = self._validate_agent_name(panel_id, field="panel id")
+        clean_title = " ".join(str(title).split())
+        if not clean_title or len(clean_title) > 80:
+            raise ValueError("panel title must be between 1 and 80 characters")
+        payload = self._validate_json_object(document, field="panel document")
+        updated_at = _utc_now()
+        with self._database() as db:
+            try:
+                db.execute(
+                    """
+                    INSERT INTO agent_panels(agent, panel_id, title, document_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(agent, panel_id) DO UPDATE SET
+                        title = excluded.title,
+                        document_json = excluded.document_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        clean_agent,
+                        clean_panel_id,
+                        clean_title,
+                        json.dumps(payload, ensure_ascii=False),
+                        updated_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise KeyError(f"unknown agent instance {clean_agent}") from exc
+        return self.get_agent_panel(clean_agent, clean_panel_id)
+
+    def list_agent_panels(self, agent: str) -> list[AgentPanel]:
+        clean_agent = self._validate_agent_name(agent, field="agent")
+        with self._database() as db:
+            rows = db.execute(
+                "SELECT * FROM agent_panels WHERE agent = ? ORDER BY panel_id",
+                (clean_agent,),
+            ).fetchall()
+        return [self._agent_panel_from_row(row) for row in rows]
+
+    def get_agent_panel(self, agent: str, panel_id: str) -> AgentPanel:
+        clean_agent = self._validate_agent_name(agent, field="agent")
+        clean_panel_id = self._validate_agent_name(panel_id, field="panel id")
+        with self._database() as db:
+            row = db.execute(
+                "SELECT * FROM agent_panels WHERE agent = ? AND panel_id = ?",
+                (clean_agent, clean_panel_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown panel {clean_panel_id} for agent {clean_agent}")
+        return self._agent_panel_from_row(row)
+
+    def delete_agent_panel(self, agent: str, panel_id: str) -> None:
+        panel = self.get_agent_panel(agent, panel_id)
+        with self._database() as db:
+            db.execute(
+                "DELETE FROM agent_panels WHERE agent = ? AND panel_id = ?",
+                (panel.agent, panel.panel_id),
+            )
+
+    @staticmethod
+    def default_agent_permissions() -> dict[str, Any]:
+        return {
+            "read": {"mode": "all", "chat_ids": [], "patterns": []},
+            "write": {"mode": "all", "chat_ids": [], "patterns": []},
+        }
+
+    @staticmethod
+    def _validate_json_object(value: Any, *, field: str) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ValueError(f"{field} must be an object")
+        encoded = json.dumps(value, ensure_ascii=False, default=str)
+        if len(encoded.encode("utf-8")) > 262144:
+            raise ValueError(f"{field} must be at most 262144 bytes")
+        return json.loads(encoded)
+
+    @classmethod
+    def _validate_secrets(cls, value: Any) -> dict[str, str]:
+        if not isinstance(value, dict):
+            raise ValueError("secrets must be an object")
+        return {
+            cls._validate_secret_key(key): cls._validate_secret_value(secret)
+            for key, secret in value.items()
+            if secret is not None and secret != ""
+        }
+
+    @staticmethod
+    def _validate_secret_key(value: Any) -> str:
+        clean = str(value).strip()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", clean):
+            raise ValueError("secret names must be uppercase environment variable names")
+        return clean
+
+    @staticmethod
+    def _validate_secret_value(value: Any) -> str:
+        clean = str(value)
+        if "\x00" in clean or "\n" in clean or "\r" in clean or len(clean) > 8192:
+            raise ValueError("secret values must be single-line strings up to 8192 characters")
+        return clean
 
     @staticmethod
     def _validate_agent_name(value: str, *, field: str) -> str:
@@ -1123,6 +1631,44 @@ class SQLiteStore:
         )
 
     @staticmethod
+    def _agent_instance_from_row(row: sqlite3.Row) -> AgentInstance:
+        try:
+            config = json.loads(str(row["config_json"] or "{}"))
+            secrets = json.loads(str(row["secrets_json"] or "{}"))
+            permissions = json.loads(str(row["permissions_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            config, secrets, permissions = {}, {}, {}
+        return AgentInstance(
+            id=str(row["id"]),
+            plugin_id=str(row["plugin_id"]),
+            name=str(row["name"]),
+            config=config if isinstance(config, dict) else {},
+            secrets=secrets if isinstance(secrets, dict) else {},
+            permissions=(
+                permissions
+                if isinstance(permissions, dict) and permissions
+                else SQLiteStore.default_agent_permissions()
+            ),
+            autostart=bool(row["autostart"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _agent_panel_from_row(row: sqlite3.Row) -> AgentPanel:
+        try:
+            document = json.loads(str(row["document_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            document = {}
+        return AgentPanel(
+            agent=str(row["agent"]),
+            panel_id=str(row["panel_id"]),
+            title=str(row["title"]),
+            document=document if isinstance(document, dict) else {},
+            updated_at=str(row["updated_at"]),
+        )
+
+    @staticmethod
     def _chat_from_row(row: sqlite3.Row) -> StoredChat:
         return StoredChat(
             id=int(row["id"]),
@@ -1145,6 +1691,7 @@ class SQLiteStore:
             chat=str(row["chat"]),
             chat_type=ChatType(row["chat_type"]),
             sender=row["sender"],
+            sender_organization=row["sender_organization"],
             content=str(row["content"]),
             message_type=str(row["message_type"]),
             direction=str(row["direction"]),

@@ -20,6 +20,7 @@ class FakeServiceClient:
         self.calls = []
         self.sent = []
         self.unread = []
+        self.discovered_types = {}
         self._counter = 0
         self.send_started = threading.Event()
         self.send_gate = None
@@ -49,6 +50,9 @@ class FakeServiceClient:
 
     def visible_chat_name(self):
         return self.visible_chat
+
+    def discovered_chat_type(self, chat):
+        return self.discovered_types.get(chat, ChatType.UNKNOWN)
 
     def get_visible_messages(self, chat, *, chat_type, enrich_senders=True):
         self.visible_chat = chat
@@ -95,6 +99,100 @@ class BowxtServiceTests(unittest.TestCase):
         self.assertEqual(self.client.calls, [("群", ChatType.GROUP), ("联系人", ChatType.CONTACT)])
         self.assertEqual(len(self.store.get_messages(group.id)), 1)
         self.assertEqual(len(self.store.get_messages(contact.id)), 1)
+
+    def test_simulated_chat_receives_and_sends_without_ui_worker_or_login(self):
+        service = BowxtService(self.store, client_factory=lambda: self.client, poll_gap=1.5)
+        group = service.add_simulated_chat("无微信调试群", ChatType.GROUP)
+
+        incoming = service.inject_simulated_message(
+            group.id,
+            text="@机器人 请排查蓝屏",
+            sender="调试用户",
+            sender_organization="测试组织",
+            is_at_me=True,
+        )
+        deliveries = service.claim_agent_messages(
+            "simulation-agent",
+            chat_ids=[group.id],
+            timeout=0,
+            require_sender=True,
+            require_at_me=True,
+            replay_existing=True,
+        )
+        outgoing = service.enqueue_text(
+            group.id, "请先记录蓝屏代码", client_id="simulation-reply"
+        )
+
+        self.assertFalse(service.is_running)
+        self.assertFalse(service.status()["wechat_connected"])
+        self.assertEqual(deliveries[0].message.seq, incoming.seq)
+        self.assertEqual(deliveries[0].message.sender, "调试用户")
+        self.assertEqual(outgoing.direction, "outgoing")
+        self.assertEqual(outgoing.delivery_status, "sent")
+        self.assertTrue(outgoing.verified)
+        self.assertEqual(self.client.sent, [])
+
+    def test_simulated_group_requires_sender_and_normal_chat_rejects_injection(self):
+        service = BowxtService(self.store, client_factory=lambda: self.client, poll_gap=1.5)
+        simulated = service.add_simulated_chat("调试群", ChatType.GROUP)
+        normal = service.add_chat("真实群", ChatType.GROUP)
+        with self.assertRaises(ValueError):
+            service.inject_simulated_message(simulated.id, text="无发送人")
+        with self.assertRaises(ValueError):
+            service.inject_simulated_message(normal.id, text="伪造", sender="甲")
+
+    def test_ui_worker_never_polls_simulated_chats(self):
+        service = BowxtService(self.store, client_factory=lambda: self.client, poll_gap=1.5)
+        service.add_simulated_chat("只能留在本地", ChatType.GROUP)
+        service.add_chat("允许读取微信", ChatType.CONTACT)
+        service.start()
+        deadline = time.monotonic() + 2
+        while not self.client.calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        service.stop()
+
+        self.assertTrue(self.client.calls)
+        self.assertEqual({name for name, _kind in self.client.calls}, {"允许读取微信"})
+
+    def test_pause_also_blocks_simulated_incoming_messages(self):
+        service = BowxtService(self.store, client_factory=lambda: self.client, poll_gap=1.5)
+        simulated = service.add_simulated_chat("暂停中的调试会话", ChatType.CONTACT)
+        service.configure(mode=SyncMode.PAUSED)
+
+        with self.assertRaises(ServicePaused):
+            service.inject_simulated_message(simulated.id, text="不应进入 Agent 链路")
+        self.assertEqual(self.store.get_messages(simulated.id), [])
+
+    def test_poll_does_not_append_an_older_source_exposed_after_its_quote(self):
+        chat = self.store.upsert_chat("引用回跳群", ChatType.GROUP)
+        self.store.save_message(Message(
+            id="reply-with-quote",
+            chat=chat.name,
+            content="回复正文\n引用 黄泽文 的消息 : 已经发过的原文",
+            type=MessageType.TEXT,
+            direction=Direction.INCOMING,
+            sender="成员",
+            chat_type=ChatType.GROUP,
+        ))
+
+        class QuoteJumpClient(FakeServiceClient):
+            def get_visible_messages(self, chat, *, chat_type, enrich_senders=True):
+                return [Message(
+                    id="late-source",
+                    chat=chat,
+                    content="已经发过的原文",
+                    type=MessageType.TEXT,
+                    direction=Direction.INCOMING,
+                    chat_type=ChatType(chat_type),
+                )]
+
+        service = BowxtService(self.store, client_factory=QuoteJumpClient, poll_gap=1.5)
+        service._poll_chat(QuoteJumpClient(), chat)
+
+        self.assertEqual(
+            [item.content for item in self.store.get_messages(chat.id)],
+            ["回复正文\n引用 黄泽文 的消息 : 已经发过的原文"],
+        )
 
     def test_default_client_reads_configured_account_aliases(self):
         service = BowxtService(self.store, poll_gap=1.5)
@@ -188,7 +286,14 @@ class BowxtServiceTests(unittest.TestCase):
             def enrich_visible_senders(self, messages, *, chat=None):
                 values = list(messages)
                 self.enriched_ids.append([item.id for item in values])
-                return [replace(item, sender=f"成员{item.id.rsplit('-', 1)[-1]}") for item in values]
+                return [
+                    replace(
+                        item,
+                        sender=f"成员{item.id.rsplit('-', 1)[-1]}",
+                        raw={**item.raw, "sender_source": "profile_uia"},
+                    )
+                    for item in values
+                ]
 
         client = BurstSenderClient()
         service = BowxtService(self.store, client_factory=lambda: client, poll_gap=1.5)
@@ -205,6 +310,8 @@ class BowxtServiceTests(unittest.TestCase):
             [message.sender for message in self.store.get_messages(group.id)],
             ["成员1", "成员2", "成员3"],
         )
+        service._poll_chat(client, group)
+        self.assertEqual(service.status()["sender_queue_depth"], 0)
 
     def test_send_jumps_ahead_of_remaining_sender_jobs(self):
         class PriorityClient(FakeServiceClient):
@@ -276,6 +383,7 @@ class BowxtServiceTests(unittest.TestCase):
 
     def test_unread_discovery_persists_and_emits_a_new_chat(self):
         self.client.unread = ["自动会话"]
+        self.client.discovered_types["自动会话"] = ChatType.GROUP
         service = BowxtService(self.store, client_factory=lambda: self.client, poll_gap=1.5)
         subscriber = service.events.subscribe()
         service.start()
@@ -284,7 +392,8 @@ class BowxtServiceTests(unittest.TestCase):
             time.sleep(0.01)
         service.stop()
         self.assertEqual([chat.name for chat in self.store.list_chats()], ["自动会话"])
-        self.assertIn(("自动会话", ChatType.UNKNOWN), self.client.calls)
+        self.assertEqual(self.store.list_chats()[0].chat_type, ChatType.GROUP)
+        self.assertIn(("自动会话", ChatType.GROUP), self.client.calls)
         events = []
         while not subscriber.empty():
             events.append(subscriber.get_nowait())

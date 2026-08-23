@@ -2,10 +2,12 @@ import unittest
 
 from bowxt.models import Rect
 from bowxt.selectors import (
+    ProfileIdentity,
     find_editor,
     find_mention_candidate,
     find_message_list,
     find_profile_name,
+    find_profile_identity,
     find_search_box,
     visible_message_nodes,
 )
@@ -75,7 +77,15 @@ class SelectorTests(unittest.TestCase):
             nodes=[
                 FakeNode("button", "黄泽文", bounds=Rect(483, 465, 60, 60)),
                 FakeNode("label", "黄泽文", bounds=Rect(559, 465, 69, 26)),
+                FakeNode("label", "@柯基服务队", bounds=Rect(559, 493, 92, 19)),
                 FakeNode("button", "添加备注名", bounds=Rect(559, 530, 100, 26)),
+                FakeNode("label", "企业信息", bounds=Rect(483, 595, 232, 19)),
+                FakeNode("label", "来自", bounds=Rect(483, 622, 65, 21)),
+                FakeNode("label", "企业微信", bounds=Rect(574, 622, 141, 21)),
+                FakeNode("label", "企业", bounds=Rect(483, 647, 65, 21)),
+                FakeNode("label", "柯基服务队", bounds=Rect(574, 647, 141, 21)),
+                FakeNode("label", "实名", bounds=Rect(483, 672, 65, 21)),
+                FakeNode("label", "黄泽文", bounds=Rect(574, 672, 141, 21)),
                 FakeNode("button", "发消息", bounds=Rect(483, 756, 72, 59)),
                 FakeNode("button", "语音聊天", bounds=Rect(566, 756, 72, 59)),
                 FakeNode("button", "视频聊天", bounds=Rect(649, 756, 72, 59)),
@@ -83,6 +93,10 @@ class SelectorTests(unittest.TestCase):
         )
 
         self.assertEqual(find_profile_name(profile), "黄泽文")
+        self.assertEqual(
+            find_profile_identity(profile),
+            ProfileIdentity(name="黄泽文", organization="柯基服务队"),
+        )
 
     def test_virtual_rows_outside_message_viewport_are_ignored(self):
         visible = FakeNode("list item", "当前消息", bounds=Rect(100, 120, 400, 50))

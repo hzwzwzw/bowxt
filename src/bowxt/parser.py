@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Iterable
 
 from .accessibility import Node, attr_blob, related_nodes, walk
@@ -13,6 +13,7 @@ from .selectors import text_values, visible_message_nodes
 
 _TIME_ONLY = re.compile(r"^(?:上午|下午|晚上|凌晨)?\s*\d{1,2}:\d{2}$")
 _DATE_TIME = re.compile(r"^(?:(\d{4})[-/.年])?(\d{1,2})[-/.月](\d{1,2})日?\s+(\d{1,2}):(\d{2})$")
+_RELATIVE_DATE_TIME = re.compile(r"^(昨天|前天)\s+(\d{1,2}):(\d{2})$")
 _GENERIC = {
     "头像", "avatar", "图片", "image", "消息", "message", "已读", "未读",
     "更多", "more", "菜单", "menu", "发送", "send",
@@ -343,8 +344,6 @@ class MessageParser:
 
         match = re.match(r"^([^:\n：]{1,32})[：:]\s+(.+)$", value, re.DOTALL)
         if not match:
-            match = re.match(r"^([^\n]{1,32})\n(.+)$", value, re.DOTALL)
-        if not match:
             return None, value
         sender, content = match.group(1).strip(), match.group(2).strip()
         # Bracketed application metadata such as ``[conv: 12ab34cd]`` is
@@ -362,7 +361,11 @@ class MessageParser:
     @staticmethod
     def _looks_like_time(value: str) -> bool:
         value = value.strip()
-        return bool(_TIME_ONLY.match(value) or _DATE_TIME.match(value)) or value in {
+        return bool(
+            _TIME_ONLY.match(value)
+            or _DATE_TIME.match(value)
+            or _RELATIVE_DATE_TIME.match(value)
+        ) or value in {
             "昨天", "前天", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"
         }
 
@@ -390,6 +393,14 @@ class MessageParser:
             year, month, day, hour, minute = match.groups()
             return now.replace(
                 year=int(year or now.year), month=int(month), day=int(day),
+                hour=int(hour), minute=int(minute), second=0, microsecond=0,
+            )
+        relative_match = _RELATIVE_DATE_TIME.match(text.strip())
+        if relative_match:
+            label, hour, minute = relative_match.groups()
+            days = 1 if label == "昨天" else 2
+            target = now - timedelta(days=days)
+            return target.replace(
                 hour=int(hour), minute=int(minute), second=0, microsecond=0,
             )
         return None

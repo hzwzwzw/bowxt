@@ -11,6 +11,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Callable, Iterable
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .models import ChatType
@@ -50,6 +51,46 @@ class AgentClient:
     def list_chats(self) -> list[StoredChat]:
         value = self._request("GET", "/api/chats")
         return [_stored_chat(item) for item in value.get("chats", [])]
+
+    def get_history(
+        self,
+        chat: StoredChat | int | str,
+        *,
+        duration_seconds: float,
+        until: datetime | None = None,
+    ) -> list[StoredMessage]:
+        """Read every persisted message in one chat during a bounded time range."""
+
+        duration = float(duration_seconds)
+        if duration <= 0 or duration > 31 * 86400:
+            raise ValueError("duration_seconds must be between 0 and 31 days")
+        target = self._history_chat(chat)
+        end = until or datetime.now(timezone.utc)
+        if end.tzinfo is None or end.utcoffset() is None:
+            raise ValueError("until must include a timezone")
+        end = end.astimezone(timezone.utc)
+        start = end - timedelta(seconds=duration)
+        messages: list[StoredMessage] = []
+        after = 0
+        while True:
+            query = urllib.parse.urlencode(
+                {
+                    "since": start.isoformat(),
+                    "until": end.isoformat(),
+                    "after": after,
+                    "limit": 1000,
+                }
+            )
+            value = self._request("GET", f"/api/chats/{target.id}/history?{query}")
+            page = [_stored_message(item) for item in value.get("messages", [])]
+            messages.extend(page)
+            next_after = value.get("next_after")
+            if next_after is None:
+                return messages
+            next_value = int(next_after)
+            if next_value <= after:
+                raise AgentAPIError("bowxt history pagination did not advance")
+            after = next_value
 
     def ensure_chat(
         self,
@@ -125,10 +166,12 @@ class AgentClient:
         client_id: str | None = None,
         chat_type: ChatType | str = ChatType.UNKNOWN,
     ) -> StoredMessage:
-        target = self._resolve_chat(chat, chat_type=chat_type)
+        target_id = int(chat) if isinstance(chat, int) else self._resolve_chat(
+            chat, chat_type=chat_type
+        ).id
         value = self._request(
             "POST",
-            f"/api/chats/{target.id}/messages",
+            f"/api/chats/{target_id}/messages",
             {
                 "text": text,
                 "mentions": list(mentions),
@@ -161,7 +204,7 @@ class AgentClient:
             raise ValueError("message has no captured image")
         request = urllib.request.Request(
             urllib.parse.urljoin(self.base_url + "/", message.image_url.lstrip("/")),
-            headers={"Accept": "image/png"},
+            headers={"Accept": "image/png", "X-Bowxt-Agent": self.consumer},
         )
         try:
             with urllib.request.urlopen(request, timeout=self.request_timeout) as response:
@@ -233,6 +276,37 @@ class AgentClient:
             },
         )
         return _agent_log(value["log"])
+
+    def publish_panel(
+        self,
+        panel_id: str,
+        title: str,
+        nodes: list[dict[str, Any]],
+        *,
+        empty_text: str = "暂无数据",
+    ) -> dict[str, Any]:
+        """Publish a declarative tree panel in this Agent's WebIM card."""
+
+        value = self._request(
+            "PUT",
+            f"/api/agent/panels/{urllib.parse.quote(str(panel_id), safe='')}",
+            {
+                "title": title,
+                "document": {
+                    "version": 1,
+                    "type": "tree",
+                    "nodes": nodes,
+                    "empty_text": empty_text,
+                },
+            },
+        )
+        return dict(value["panel"])
+
+    def delete_panel(self, panel_id: str) -> None:
+        self._request(
+            "DELETE",
+            f"/api/agent/panels/{urllib.parse.quote(str(panel_id), safe='')}",
+        )
 
     def run_forever(
         self,
@@ -318,6 +392,18 @@ class AgentClient:
         match = next((item for item in self.list_chats() if item.name == str(chat)), None)
         return match or self.ensure_chat(str(chat), chat_type)
 
+    def _history_chat(self, chat: StoredChat | int | str) -> StoredChat:
+        if isinstance(chat, StoredChat):
+            return chat
+        values = self.list_chats()
+        if isinstance(chat, int):
+            match = next((item for item in values if item.id == chat), None)
+        else:
+            match = next((item for item in values if item.name == str(chat)), None)
+        if match is None:
+            raise KeyError(f"unknown chat {chat}")
+        return match
+
     def _request(
         self,
         method: str,
@@ -327,7 +413,7 @@ class AgentClient:
         timeout: float | None = None,
     ) -> dict[str, Any]:
         data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
-        headers = {"Accept": "application/json"}
+        headers = {"Accept": "application/json", "X-Bowxt-Agent": self.consumer}
         if data is not None:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(
@@ -376,6 +462,7 @@ def _stored_message(value: dict[str, Any]) -> StoredMessage:
         chat=str(value["chat"]),
         chat_type=ChatType(value["chat_type"]),
         sender=value.get("sender"),
+        sender_organization=value.get("sender_organization"),
         content=str(value["content"]),
         message_type=str(value["message_type"]),
         direction=str(value["direction"]),

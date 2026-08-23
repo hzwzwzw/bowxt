@@ -100,6 +100,35 @@ class ParserTests(unittest.TestCase):
         result = parser._parse_time("下午 3:06")
         self.assertEqual((result.hour, result.minute), (15, 6))
 
+    def test_yesterday_time_separator_is_not_parsed_as_message(self):
+        message_list = FakeNode(
+            "list",
+            "消息",
+            bounds=Rect(0, 0, 500, 300),
+            nodes=[
+                FakeNode("list item", "昨天 23:04", bounds=Rect(200, 20, 100, 24)),
+                FakeNode(
+                    "list item", "测试",
+                    attributes={"class": "message incoming"},
+                    bounds=Rect(0, 60, 300, 50),
+                ),
+            ],
+        )
+        parser = MessageParser(
+            now=lambda: datetime(2026, 8, 20, 14, tzinfo=timezone.utc)
+        )
+
+        messages = parser.parse_list(
+            message_list, chat="hzw", chat_type=ChatType.CONTACT
+        )
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].content, "测试")
+        self.assertEqual(
+            messages[0].timestamp,
+            datetime(2026, 8, 19, 23, 4, tzinfo=timezone.utc),
+        )
+
     def test_strong_group_sender_prefix_is_split(self):
         row = FakeNode(
             "list item", "Alice: hello group",
@@ -110,6 +139,36 @@ class ParserTests(unittest.TestCase):
             message_list, chat="group", chat_type=ChatType.GROUP
         )[0]
         self.assertEqual((message.sender, message.content), ("Alice", "hello group"))
+
+    def test_multiline_group_message_is_not_split_as_sender(self):
+        content = "第一行正文\n第二行正文"
+        row = FakeNode(
+            "list item", content,
+            attributes={"class": "message incoming"}, bounds=Rect(0, 0, 300, 80),
+        )
+        message_list = FakeNode("list", "Messages", bounds=Rect(0, 0, 500, 300), nodes=[row])
+
+        message = MessageParser().parse_list(
+            message_list, chat="group", chat_type=ChatType.GROUP
+        )[0]
+
+        self.assertIsNone(message.sender)
+        self.assertEqual(message.content, content)
+
+    def test_quoted_group_message_does_not_treat_body_as_sender(self):
+        content = "请问今晚可以来吗[嘿哈]\n引用 张钧 的消息 : 原消息"
+        row = FakeNode(
+            "list item", content,
+            attributes={"class": "message incoming"}, bounds=Rect(0, 0, 300, 100),
+        )
+        message_list = FakeNode("list", "Messages", bounds=Rect(0, 0, 500, 300), nodes=[row])
+
+        message = MessageParser().parse_list(
+            message_list, chat="group", chat_type=ChatType.GROUP
+        )[0]
+
+        self.assertIsNone(message.sender)
+        self.assertEqual(message.content, content)
 
     def test_bracketed_conversation_id_is_not_split_as_sender(self):
         row = FakeNode(

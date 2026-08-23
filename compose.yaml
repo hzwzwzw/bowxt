@@ -21,6 +21,7 @@ services:
       BOWXT_SYNC_MODE: "${BOWXT_SYNC_MODE:-polling}"
       BOWXT_UIA_SENDER: "${BOWXT_UIA_SENDER:-1}"
       BOWXT_MY_NAMES: "${BOWXT_MY_NAMES:-}"
+      BOWXT_AGENT_PLUGIN_DIRS: "/opt/bowxt-agents:/home/wechat/.local/share/bowxt/plugins"
       TZ: Asia/Shanghai
     ports:
       - "127.0.0.1:${NOVNC_PORT:-6080}:6080"
@@ -28,6 +29,7 @@ services:
       - "127.0.0.1:${WEB_PORT:-8787}:8787"
     volumes:
       - wechat-home:/home/wechat
+      - ${BOWXT_AGENT_PLUGIN_HOST_DIR:-../kjfwd-bot}:/opt/bowxt-agents/kjfwd-bot:ro,z
     shm_size: "1gb"
     restart: unless-stopped
     security_opt:

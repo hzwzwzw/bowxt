@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from bowxt import ChatType, SafetyPolicy, WeChatClient
 from bowxt.models import Direction, Message, MessageImage, MessageType, Rect
+from bowxt.selectors import ProfileIdentity
 
 from fakes import FakeAccessibility, FakeClipboard, FakeInput, FakeNode, sample_tree
 
@@ -95,7 +96,10 @@ class ClientTests(unittest.TestCase):
             token="profile-popup",
             nodes=[
                 FakeNode("button", "张三", bounds=Rect(748, 356, 60, 60), token="avatar"),
+                FakeNode("label", "@示例组织", bounds=Rect(820, 382, 90, 20), token="org-top"),
                 FakeNode("label", "Remark", bounds=Rect(748, 448, 65, 29), token="remark"),
+                FakeNode("label", "企业", bounds=Rect(748, 560, 65, 21), token="org-label"),
+                FakeNode("label", "示例组织", bounds=Rect(838, 560, 120, 21), token="org-value"),
                 FakeNode("button", "Messages", bounds=Rect(748, 646, 72, 58), token="messages"),
                 FakeNode("button", "Voice Call", bounds=Rect(831, 646, 72, 58), token="call"),
             ],
@@ -135,6 +139,7 @@ class ClientTests(unittest.TestCase):
 
         incoming = next(item for item in messages if item.content == "你好")
         self.assertEqual(incoming.sender, "张三")
+        self.assertEqual(incoming.sender_organization, "示例组织")
         self.assertEqual(incoming.raw["sender_source"], "profile_uia")
         self.assertIsNone(accessibility.popup)
         self.assertIn(("press", "esc"), inputs.events)
@@ -190,9 +195,9 @@ class ClientTests(unittest.TestCase):
 
         def read_sender(bounds, **_kwargs):
             reads.append(bounds.y)
-            return f"成员{len(reads)}"
+            return ProfileIdentity(f"成员{len(reads)}", "测试组织")
 
-        client._read_profile_sender = read_sender
+        client._read_profile_identity = read_sender
         messages = [
             Message(
                 id=f"new-{index}",
@@ -211,6 +216,10 @@ class ClientTests(unittest.TestCase):
 
         self.assertEqual(reads, [240, 300, 360])
         self.assertEqual([item.sender for item in enriched], ["成员1", "成员2", "成员3"])
+        self.assertEqual(
+            [item.sender_organization for item in enriched],
+            ["测试组织", "测试组织", "测试组织"],
+        )
 
     def test_profile_that_will_not_close_locks_all_later_input(self):
         _root, accessibility, inputs = self._profile_fixture(closes_on_escape=False)
@@ -285,6 +294,23 @@ class ClientTests(unittest.TestCase):
 
         self.assertEqual(client.visible_chat_name(), "测试群")
 
+    def test_visible_group_title_ignores_new_message_scroll_button(self):
+        root, message_list = sample_tree()
+        message_list.bounds = Rect(240, 150, 680, 500)
+        root.nodes.append(FakeNode(
+            "button", "7条新消息", bounds=Rect(790, 170, 115, 51), token="new-message-button",
+            nodes=[FakeNode(
+                "label", "7条新消息", bounds=Rect(820, 185, 60, 20), token="new-message-label"
+            )],
+        ))
+        root.nodes.append(FakeNode(
+            "label", "(199)", bounds=Rect(625, 30, 45, 30), token="member-count"
+        ))
+        client = WeChatClient(accessibility=FakeAccessibility(root)).connect()
+
+        self.assertEqual(client.visible_chat_name(), "测试群")
+        self.assertEqual(client._chat_type, ChatType.GROUP)
+
     def test_unread_discovery_clicks_visible_row_and_reads_header_without_splitting_preview(self):
         root, _message_list = sample_tree()
         header = next(node for node in root.nodes if node.token == "header")
@@ -316,6 +342,34 @@ class ClientTests(unittest.TestCase):
 
         self.assertEqual(discovered, ["新 会话"])
         self.assertEqual(inputs.events, [("click", *unread.bounds.center, 1)])
+
+    def test_unread_discovery_records_group_type_from_header_member_count(self):
+        root, _message_list = sample_tree()
+        header = next(node for node in root.nodes if node.token == "header")
+        header.name = "原会话"
+        root.nodes.append(FakeNode(
+            "label", "(199)", bounds=Rect(625, 30, 45, 30), token="member-count"
+        ))
+        unread = FakeNode(
+            "list item", "测试群 2条未读 预览", bounds=Rect(20, 100, 210, 68), token="unread-row"
+        )
+        root.nodes.insert(1, FakeNode(
+            "list", "会话", bounds=Rect(20, 100, 210, 600), nodes=[unread], token="sessions"
+        ))
+
+        class UnreadInput(FakeInput):
+            def click(self, x, y, *, count=1):
+                super().click(x, y, count=count)
+                header.name = "测试群"
+
+        client = WeChatClient(
+            accessibility=FakeAccessibility(root),
+            input_backend=UnreadInput(),
+            sleeper=lambda _seconds: None,
+        ).connect()
+
+        self.assertEqual(client.discover_unread_chats(), ["测试群"])
+        self.assertEqual(client.discovered_chat_type("测试群"), ChatType.GROUP)
 
     def test_unread_discovery_opens_every_badged_row_in_one_scan(self):
         root, _message_list = sample_tree()

@@ -18,12 +18,13 @@ from .parser import MessageParser
 from .safety import SafetyPolicy, SendRateLimiter
 from .selectors import (
     DEFAULT_PROFILE,
+    ProfileIdentity,
     WeChatProfile,
     find_editor,
     find_exact_text,
     find_message_list,
     find_mention_candidate,
-    find_profile_name,
+    find_profile_identity,
     find_search_box,
     find_session_list,
 )
@@ -67,8 +68,9 @@ class WeChatClient:
         self._lock = threading.RLock()
         self._listeners: list[object] = []
         self._known_outgoing: deque[tuple[str, str, float]] = deque(maxlen=128)
+        self._discovered_chat_types: dict[str, ChatType] = {}
         self._visual_cache: OrderedDict[
-            str, tuple[Direction, str | None, float | None, str | None]
+            str, tuple[Direction, str | None, str | None, float | None, str | None]
         ] = OrderedDict()
         self._interaction_blocked = False
         if auto_connect:
@@ -234,7 +236,10 @@ class WeChatClient:
             needs_direction = any(item.direction is Direction.UNKNOWN for item in messages)
             needs_sender = (
                 active_type is ChatType.GROUP
-                and any(item.sender is None for item in messages)
+                and any(
+                    item.sender is None or item.sender_organization is None
+                    for item in messages
+                )
             )
             needs_image = any(
                 item.type is MessageType.IMAGE and item.bounds is not None
@@ -277,7 +282,8 @@ class WeChatClient:
                             "dependencies and desktop screen-capture permission"
                         ) from exc
             if self.uia_sender and enrich_senders and active_type is ChatType.GROUP and any(
-                item.sender is None and item.direction is Direction.INCOMING
+                (item.sender is None or item.sender_organization is None)
+                and item.direction is Direction.INCOMING
                 for item in messages
             ):
                 try:
@@ -333,12 +339,19 @@ class WeChatClient:
                         if title and title != previous_title:
                             title = re.sub(r"\s*[（(]\d+[）)]\s*$", "", title).strip()
                             if title and title not in discovered:
+                                chat_type = self._infer_chat_type(root, title)
                                 discovered.append(title)
+                                self._discovered_chat_types[title] = chat_type
                                 self._chat = title
-                                self._chat_type = ChatType.UNKNOWN
+                                self._chat_type = chat_type
                             break
                     self._sleep(0.1)
             return discovered
+
+    def discovered_chat_type(self, chat: str) -> ChatType:
+        """Return the type observed while opening an unread conversation."""
+
+        return self._discovered_chat_types.get(str(chat), ChatType.UNKNOWN)
 
     def visible_chat_name(self) -> str | None:
         """Return the currently open chat title without emitting any input."""
@@ -352,6 +365,7 @@ class WeChatClient:
                 title = re.sub(r"\s*[（(]\d+[）)]\s*$", "", title).strip()
                 if title:
                     self._chat = title
+                    self._chat_type = self._infer_chat_type(root, title)
                     return title
             return None
 
@@ -693,20 +707,37 @@ class WeChatClient:
                 result.append(item)
                 continue
             self._visual_cache.move_to_end(item.id)
-            cached_direction, cached_sender, cached_confidence, cached_source = cached
+            (
+                cached_direction,
+                cached_sender,
+                cached_organization,
+                cached_confidence,
+                cached_source,
+            ) = cached
             direction = (
                 cached_direction
                 if item.direction is Direction.UNKNOWN else item.direction
             )
             sender = cached_sender if include_sender and item.sender is None else item.sender
+            sender_organization = (
+                cached_organization
+                if include_sender and item.sender_organization is None
+                else item.sender_organization
+            )
             raw = dict(item.raw)
             if direction is not item.direction:
                 raw["direction_source"] = "window_pixels"
-            if sender is not item.sender:
+            if sender != item.sender or sender_organization != item.sender_organization:
                 raw["sender_source"] = cached_source
                 if cached_confidence is not None:
                     raw["sender_confidence"] = cached_confidence
-            result.append(replace(item, direction=direction, sender=sender, raw=raw))
+            result.append(replace(
+                item,
+                direction=direction,
+                sender=sender,
+                sender_organization=sender_organization,
+                raw=raw,
+            ))
         return result
 
     def _remember_visual(self, messages: list[Message]) -> None:
@@ -721,6 +752,7 @@ class WeChatClient:
             self._visual_cache[item.id] = (
                 item.direction,
                 item.sender,
+                item.sender_organization,
                 float(confidence) if confidence is not None else None,
                 str(sender_source) if sender_source else None,
             )
@@ -741,7 +773,7 @@ class WeChatClient:
         attempted = 0
         for item in messages:
             if (
-                item.sender is not None
+                (item.sender is not None and item.sender_organization is not None)
                 or item.chat_type is not ChatType.GROUP
                 or item.direction is not Direction.INCOMING
                 or item.bounds is None
@@ -759,30 +791,31 @@ class WeChatClient:
                 result.append(item)
                 continue
             attempted += 1
-            sender = self._read_profile_sender(
+            identity = self._read_profile_identity(
                 item.bounds,
                 message_list=message_list,
                 main_window=main_window,
                 expected_chat=expected_chat,
             )
-            result.append(
-                replace(
+            if identity:
+                result.append(replace(
                     item,
-                    sender=sender,
+                    sender=identity.name or item.sender,
+                    sender_organization=identity.organization or item.sender_organization,
                     raw={**item.raw, "sender_source": "profile_uia"},
-                )
-                if sender else item
-            )
+                ))
+            else:
+                result.append(item)
         return result
 
-    def _read_profile_sender(
+    def _read_profile_identity(
         self,
         row_bounds,
         *,
         message_list: Node,
         main_window: Node,
         expected_chat: str,
-    ) -> str | None:
+    ) -> ProfileIdentity | None:
         self._assert_clean_surface(main_window, expected_chat=expected_chat)
         clip = message_list.bounds
         if clip is None:
@@ -800,7 +833,6 @@ class WeChatClient:
         input_backend = self._ensure_input()
         input_backend.click(x, y)
         deadline = time.monotonic() + 1.8
-        sender: str | None = None
         try:
             while time.monotonic() < deadline:
                 popups = [
@@ -809,9 +841,9 @@ class WeChatClient:
                     and window.identity != main_window.identity
                 ]
                 for popup in popups:
-                    sender = find_profile_name(popup)
-                    if sender:
-                        return sender
+                    identity = find_profile_identity(popup)
+                    if identity:
+                        return identity
                 self._sleep(0.08)
             return None
         finally:
@@ -1048,6 +1080,14 @@ class WeChatClient:
         root_bounds = root.bounds
         if root_bounds is None:
             return None
+        message_list = find_message_list(root)
+        message_bounds = message_list.bounds if message_list is not None else None
+        content_left = message_bounds.x if message_bounds is not None else root_bounds.x + 180
+        header_bottom = (
+            message_bounds.y
+            if message_bounds is not None
+            else root_bounds.y + root_bounds.height * 0.25
+        )
         candidates: list[tuple[int, str]] = []
         for node, _depth in walk(root, max_depth=18):
             bounds = node.bounds
@@ -1064,9 +1104,43 @@ class WeChatClient:
             # fallback when the current conversation receives a message.
             if re.fullmatch(r"\s*[（(]\d+[）)]\s*", node.name):
                 continue
-            if bounds.y < root_bounds.y + root_bounds.height * 0.25 and bounds.x > root_bounds.x + 180:
+            # The floating scroll button inside the message pane is labelled
+            # e.g. ``7条新消息``. It is not the conversation title and must not
+            # be allowed to create a synthetic chat in unread mode.
+            if re.fullmatch(r"\s*\d+\s*条(?:新消息|未读消息?|未读)\s*", node.name):
+                continue
+            if (
+                bounds.x >= content_left
+                and bounds.y >= root_bounds.y
+                and bounds.bottom <= header_bottom
+            ):
                 candidates.append((len(node.name), node.name))
         return min(candidates, default=(0, None), key=lambda item: item[0])[1]
+
+    @staticmethod
+    def _infer_chat_type(root: Node, title: str | None = None) -> ChatType:
+        """Infer a group only from the member-count marker in the header."""
+
+        root_bounds = root.bounds
+        if root_bounds is None:
+            return ChatType.UNKNOWN
+        if title and re.search(r"[（(]\d+[）)]\s*$", title):
+            return ChatType.GROUP
+        message_list = find_message_list(root)
+        message_bounds = message_list.bounds if message_list is not None else None
+        content_left = message_bounds.x if message_bounds is not None else root_bounds.x + 180
+        header_bottom = (
+            message_bounds.y
+            if message_bounds is not None
+            else root_bounds.y + root_bounds.height * 0.25
+        )
+        for node, _depth in walk(root, max_depth=18):
+            bounds = node.bounds
+            if not bounds or bounds.x < content_left or bounds.bottom > header_bottom:
+                continue
+            if re.fullmatch(r"\s*[（(]\d+[）)]\s*", node.name):
+                return ChatType.GROUP
+        return ChatType.UNKNOWN
 
     @staticmethod
     def _visible_center(node: Node, container: Node) -> tuple[int, int] | None:

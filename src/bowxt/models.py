@@ -72,6 +72,7 @@ class Message:
     type: MessageType
     direction: Direction
     sender: str | None = None
+    sender_organization: str | None = None
     timestamp: datetime | None = None
     chat_type: ChatType = ChatType.UNKNOWN
     is_at_me: bool = False

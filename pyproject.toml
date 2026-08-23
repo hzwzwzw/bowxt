@@ -8,7 +8,7 @@ version = "0.4.0"
 description = "Containerized Linux WeChat with safe UI automation, persistence, and a web IM"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "AGPL-3.0-or-later"
+license = {text = "AGPL-3.0-or-later"}
 authors = [{name = "bowxt contributors"}]
 keywords = ["wechat", "linux", "at-spi", "accessibility", "automation"]
 classifiers = [

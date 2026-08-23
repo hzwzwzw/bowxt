@@ -48,7 +48,7 @@
         </div>
         <nav class="view-tabs" aria-label="内容视图">
           <button id="show-chat" class="view-tab active" type="button">对话</button>
-          <button id="show-logs" class="view-tab" type="button">Agent 日志</button>
+          <button id="show-agents" class="view-tab" type="button">Agent</button>
         </nav>
         <a class="vnc-link" href="http://127.0.0.1:6080/vnc.html?autoconnect=1&amp;resize=scale&amp;reconnect=1&amp;reconnect_delay=1000" target="_blank" rel="noreferrer">查看微信</a>
       </header>
@@ -58,9 +58,98 @@
         <p>新消息到达微信侧边栏后，bowxt 也会自动发现会话。</p>
       </div>
       <div id="messages" class="messages" hidden aria-live="polite"></div>
-      <section id="log-panel" class="log-panel" hidden aria-label="Agent 日志">
+      <section id="agent-panel" class="agent-panel" hidden aria-label="Agent 管理">
+        <header class="agent-panel-heading">
+          <div><h3>Agent 应用</h3><p>每个实例拥有独立 consumer、配置和进程；多个实例共享同一个微信消息中枢。</p></div>
+          <button id="add-agent" class="primary-button" type="button">添加 Agent</button>
+        </header>
+        <div id="agent-list" class="agent-grid"></div>
+      </section>
+      <form id="composer" class="composer" hidden>
+        <textarea id="message-input" rows="1" maxlength="2000" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+        <button id="simulate-receive" class="simulate-button" type="button" hidden>模拟接收</button>
+        <button id="send-button" type="submit">发送</button>
+      </form>
+    </section>
+  </main>
+
+  <dialog id="chat-dialog">
+    <form id="chat-form" class="dialog-card">
+      <div class="dialog-heading"><div><h2>添加会话</h2><p id="chat-dialog-help">名称必须与微信中的联系人或群聊完全一致</p></div><button type="button" id="close-dialog" class="icon-button">×</button></div>
+      <label>会话来源<select id="new-chat-source"><option value="wechat">微信会话</option><option value="simulation">模拟调试会话</option></select></label>
+      <label>会话名称<input id="new-chat-name" required maxlength="128" autocomplete="off" placeholder="例如：张三"></label>
+      <label>会话类型<select id="new-chat-type"><option value="contact">联系人</option><option value="group">群聊</option><option id="new-chat-unknown" value="unknown">自动判断 / 未知</option></select></label>
+      <div id="dialog-error" class="form-error"></div>
+      <button id="create-chat-submit" class="primary-button" type="submit">开始监听</button>
+    </form>
+  </dialog>
+  <dialog id="simulation-dialog">
+    <form id="simulation-form" class="dialog-card simulation-dialog-card">
+      <div class="dialog-heading"><div><h2>模拟接收消息</h2><p id="simulation-chat-label">消息会进入正常 Agent 投递链路，不操作微信</p></div><button type="button" id="close-simulation-dialog" class="icon-button">×</button></div>
+      <div class="field-grid">
+        <label>消息类型<select id="simulation-message-type"><option value="text">文字</option><option value="image">图片</option></select></label>
+        <label>消息时间<input id="simulation-time" type="datetime-local" step="1"></label>
+      </div>
+      <div id="simulation-sender-fields" class="field-grid">
+        <label>发送者<input id="simulation-sender" maxlength="128" autocomplete="off" placeholder="群成员名称"></label>
+        <label>组织名（可选）<input id="simulation-organization" maxlength="128" autocomplete="off" placeholder="例如：柯基服务队"></label>
+      </div>
+      <label id="simulation-text-field">消息内容<textarea id="simulation-text" class="plain-textarea" rows="5" maxlength="20000" placeholder="输入要模拟接收的文字"></textarea></label>
+      <label id="simulation-image-field" hidden>选择图片<input id="simulation-image" type="file" accept="image/png,image/jpeg,image/webp,image/gif"><small>支持 PNG、JPEG、WebP 和 GIF，最大 10 MiB；服务端会转为清晰 PNG。</small></label>
+      <label class="checkbox-field"><input id="simulation-at-me" type="checkbox" checked> 视为 @ 当前微信账号（可触发 mention_only Agent）</label>
+      <div id="simulation-error" class="form-error"></div>
+      <button id="simulation-submit" class="primary-button" type="submit">模拟接收</button>
+    </form>
+  </dialog>
+  <dialog id="agent-dialog">
+    <form id="agent-form" class="dialog-card agent-dialog-card">
+      <div class="dialog-heading"><div><h2 id="agent-dialog-title">添加 Agent</h2><p>插件代码由管理员安装；此处只创建和配置受信任插件实例。</p></div><button type="button" id="close-agent-dialog" class="icon-button">×</button></div>
+      <label id="agent-plugin-field">插件<select id="agent-plugin" required></select></label>
+      <div class="field-grid">
+        <label>实例 ID<input id="agent-id" required maxlength="80" pattern="[A-Za-z0-9_.:-]+" placeholder="personal-secretary"></label>
+        <label>显示名称<input id="agent-name" required maxlength="80" placeholder="个人秘书"></label>
+      </div>
+      <label>配置 JSON<textarea id="agent-config" rows="12" spellcheck="false" required></textarea><small id="agent-config-help"></small></label>
+      <section class="permission-editor">
+        <div class="permission-heading"><h3>会话权限</h3><p>在 bowxt 消息 API 边界限制此 consumer 可读、可写的会话。</p></div>
+        <div class="permission-grid">
+          <fieldset class="permission-card">
+            <legend>读取消息</legend>
+            <label>范围<select id="agent-read-mode">
+              <option value="all">所有会话</option>
+              <option value="selected">指定会话</option>
+              <option value="regex_allow">正则白名单</option>
+              <option value="regex_deny">正则黑名单</option>
+            </select></label>
+            <div id="agent-read-chats" class="permission-chats"></div>
+            <label id="agent-read-pattern-field" hidden>正则表达式（每行一个）<textarea id="agent-read-patterns" rows="4" spellcheck="false" placeholder="^客户群"></textarea></label>
+          </fieldset>
+          <fieldset class="permission-card">
+            <legend>发送消息</legend>
+            <label>范围<select id="agent-write-mode">
+              <option value="all">所有会话</option>
+              <option value="selected">指定会话</option>
+              <option value="regex_allow">正则白名单</option>
+              <option value="regex_deny">正则黑名单</option>
+            </select></label>
+            <div id="agent-write-chats" class="permission-chats"></div>
+            <label id="agent-write-pattern-field" hidden>正则表达式（每行一个）<textarea id="agent-write-patterns" rows="4" spellcheck="false" placeholder="^客户群"></textarea></label>
+          </fieldset>
+        </div>
+        <small>“指定会话”按会话 ID 保存；正则对白名单/黑名单按完整会话名称匹配。</small>
+      </section>
+      <section><h3 class="secret-heading">密钥与环境变量</h3><div id="agent-secrets" class="secret-fields"></div></section>
+      <label class="checkbox-field"><input id="agent-autostart" type="checkbox"> bowxt 启动时自动运行</label>
+      <div id="agent-dialog-error" class="form-error"></div>
+      <button class="primary-button" type="submit">保存配置</button>
+    </form>
+  </dialog>
+  <dialog id="agent-log-dialog" class="wide-dialog">
+    <section class="dialog-card log-dialog-card">
+      <div class="dialog-heading"><div><h2 id="agent-log-title">Agent 日志</h2><p>日志持久化保存，并随 Agent 运行实时更新。</p></div><button type="button" id="close-agent-log-dialog" class="icon-button">×</button></div>
+      <section id="log-panel" class="log-panel" aria-label="Agent 日志">
         <div class="log-toolbar">
-          <input id="log-search" type="search" placeholder="搜索 Agent、事件或日志正文" aria-label="搜索日志">
+          <input id="log-search" type="search" placeholder="搜索事件或日志正文" aria-label="搜索日志">
           <select id="log-level" aria-label="日志级别">
             <option value="all">全部级别</option>
             <option value="debug">Debug</option>
@@ -73,21 +162,13 @@
         </div>
         <div id="logs" class="logs" aria-live="polite"></div>
       </section>
-      <form id="composer" class="composer" hidden>
-        <textarea id="message-input" rows="1" maxlength="2000" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
-        <button id="send-button" type="submit">发送</button>
-      </form>
     </section>
-  </main>
-
-  <dialog id="chat-dialog">
-    <form id="chat-form" class="dialog-card">
-      <div class="dialog-heading"><div><h2>添加会话</h2><p>名称必须与微信中的联系人或群聊完全一致</p></div><button type="button" id="close-dialog" class="icon-button">×</button></div>
-      <label>会话名称<input id="new-chat-name" required maxlength="128" autocomplete="off" placeholder="例如：张三"></label>
-      <label>会话类型<select id="new-chat-type"><option value="contact">联系人</option><option value="group">群聊</option><option value="unknown">自动判断 / 未知</option></select></label>
-      <div id="dialog-error" class="form-error"></div>
-      <button class="primary-button" type="submit">开始监听</button>
-    </form>
+  </dialog>
+  <dialog id="agent-custom-panel-dialog" class="wide-dialog">
+    <section class="dialog-card custom-panel-dialog-card">
+      <div class="dialog-heading"><div><h2 id="agent-custom-panel-title">Agent 自定义面板</h2><p id="agent-custom-panel-meta">由 Agent 通过声明式接口发布，只展示文本和层级结构。</p></div><button type="button" id="close-agent-custom-panel-dialog" class="icon-button">×</button></div>
+      <div id="agent-custom-panel-content" class="custom-panel-content" aria-live="polite"></div>
+    </section>
   </dialog>
   <script src="/app.js" defer></script>
 </body>

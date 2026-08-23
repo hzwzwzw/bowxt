@@ -104,6 +104,19 @@ class SQLiteStoreTests(unittest.TestCase):
         self.assertEqual(discovered.chat_type, ChatType.GROUP)
         self.assertEqual(discovered.source, "manual")
 
+    def test_simulated_chat_source_is_explicit_unique_and_sticky(self):
+        simulated = self.store.create_simulated_chat("本地调试群", ChatType.GROUP)
+        self.assertEqual(simulated.source, "simulation")
+        ensured = self.store.upsert_chat(
+            simulated.name, ChatType.GROUP, source="manual"
+        )
+        self.assertEqual(ensured.id, simulated.id)
+        self.assertEqual(ensured.source, "simulation")
+        with self.assertRaises(ValueError):
+            self.store.create_simulated_chat(simulated.name, ChatType.GROUP)
+        with self.assertRaises(ValueError):
+            self.store.create_simulated_chat("未知模拟", ChatType.UNKNOWN)
+
     def test_verified_receipt_and_observed_echo_share_one_row(self):
         receipt = SendReceipt(
             chat="张三",
@@ -144,6 +157,21 @@ class SQLiteStoreTests(unittest.TestCase):
         self.assertEqual([item.content for item in recent], ["3", "4"])
         self.assertEqual([item.content for item in older], ["1", "2"])
 
+    def test_message_history_filters_by_effective_message_time(self):
+        for message_id, hour in (("outside", 9), ("inside-a", 10), ("inside-b", 11)):
+            self.store.save_message(replace(
+                incoming(message_id, chat="历史群", content=message_id),
+                timestamp=datetime(2026, 8, 20, hour, 0, tzinfo=timezone.utc),
+            ))
+        chat = self.store.list_chats()[0]
+        values = self.store.message_history(
+            chat.id,
+            since="2026-08-20T10:00:00+00:00",
+            until="2026-08-20T11:00:00+00:00",
+            limit=100,
+        )
+        self.assertEqual([item.content for item in values], ["inside-a", "inside-b"])
+
     def test_agent_delivery_is_durable_idempotent_and_retryable(self):
         first, _ = self.store.save_message(incoming("agent-1", content="一"))
         second, _ = self.store.save_message(incoming("agent-2", content="二"))
@@ -180,6 +208,22 @@ class SQLiteStoreTests(unittest.TestCase):
         older = self.store.get_agent_logs(before_seq=recent[0].seq, limit=2)
         self.assertEqual([item.message for item in recent], ["line 1", "line 2"])
         self.assertEqual([item.message for item in older], ["line 0"])
+
+    def test_agent_consumer_records_the_actual_claim_scope(self):
+        first = self.store.upsert_chat("范围一")
+        second = self.store.upsert_chat("范围二")
+        self.store.claim_agent_messages(
+            "scope-agent", chat_ids=[second.id, first.id], deny_all_chats=False
+        )
+        activity = self.store.get_agent_consumer_activity("scope-agent")
+        self.assertEqual(activity["last_claim_chat_ids"], [second.id, first.id])
+        self.assertIsNotNone(activity["last_claim_at"])
+
+        self.store.claim_agent_messages("scope-agent", deny_all_chats=True)
+        self.assertEqual(
+            self.store.get_agent_consumer_activity("scope-agent")["last_claim_chat_ids"],
+            [],
+        )
 
     def test_agent_claim_filters_and_competing_workers(self):
         self.store.save_message(incoming("not-mentioned", content="普通消息"))
@@ -311,6 +355,7 @@ class SQLiteStoreTests(unittest.TestCase):
             type=without_sender.type,
             direction=without_sender.direction,
             sender="群成员",
+            sender_organization="示例组织",
             timestamp=timestamp,
             chat_type=without_sender.chat_type,
             raw={"visible_occurrence": 0, "sender_source": "profile_uia"},
@@ -322,8 +367,38 @@ class SQLiteStoreTests(unittest.TestCase):
         self.assertFalse(created_again)
         self.assertEqual(same.seq, first.seq)
         self.assertEqual(same.sender, "群成员")
+        self.assertEqual(same.sender_organization, "示例组织")
+        self.assertTrue(self.store.sender_profile_checked(same.seq))
         self.assertEqual(same.message_id, "with-sender")
         self.assertEqual(len(self.store.get_messages(first.chat_id)), 1)
+
+    def test_late_virtualized_source_already_seen_in_quote_is_historical(self):
+        quoted = Message(
+            id="quoted-reply",
+            chat="引用回跳群",
+            content="回复正文\n引用 黄泽文 的消息 : 较早的原消息",
+            type=MessageType.TEXT,
+            direction=Direction.INCOMING,
+            sender="Maxim刘",
+            timestamp=None,
+            chat_type=ChatType.GROUP,
+        )
+        self.store.save_message(quoted)
+        source = Message(
+            id="late-source",
+            chat=quoted.chat,
+            content="较早的原消息",
+            type=MessageType.TEXT,
+            direction=Direction.INCOMING,
+            sender=None,
+            timestamp=None,
+            chat_type=ChatType.GROUP,
+        )
+
+        self.assertTrue(self.store.is_historical_quote_source(source))
+        self.assertFalse(self.store.is_historical_quote_source(replace(
+            source, id="new-content", content="真正的新消息"
+        )))
 
     def test_missing_time_and_sender_reuses_existing_group_bubbles(self):
         timestamp = datetime(2026, 8, 19, 12, 9, tzinfo=timezone.utc)

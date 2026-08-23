@@ -22,6 +22,15 @@ image_name=bowxt:0.4.0
 volume_name=bowxt-home
 context_dir=$project_dir
 vnc_scope=${VNC_SCOPE:-window}
+plugin_host_dir=${BOWXT_AGENT_PLUGIN_HOST_DIR:-$project_dir/../kjfwd-bot}
+if [[ -f "$plugin_host_dir/bowxt-agent.json" ]]; then
+  plugin_host_dir=$(cd -- "$plugin_host_dir" && pwd)
+elif [[ -n "${BOWXT_AGENT_PLUGIN_HOST_DIR:-}" ]]; then
+  echo "BOWXT_AGENT_PLUGIN_HOST_DIR does not contain bowxt-agent.json: $plugin_host_dir" >&2
+  exit 2
+else
+  plugin_host_dir=""
+fi
 
 docker_run() {
   if docker info >/dev/null 2>&1; then
@@ -72,12 +81,14 @@ case "${1:-help}" in
       current_mode=$(docker_run inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container_name" | sed -n 's/^BOWXT_SYNC_MODE=//p')
       current_sender=$(docker_run inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container_name" | sed -n 's/^BOWXT_UIA_SENDER=//p')
       current_my_names=$(docker_run inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container_name" | sed -n 's/^BOWXT_MY_NAMES=//p')
+      current_plugin=$(docker_run inspect -f '{{range .Mounts}}{{if eq .Destination "/opt/bowxt-agents/kjfwd-bot"}}{{.Source}}{{end}}{{end}}' "$container_name")
       if [[ "$current_image" != "$desired_image" || "$current_scope" != "$vnc_scope" \
         || "$current_poll" != "${BOWXT_POLL_GAP:-1.5}" \
         || "$current_action" != "${BOWXT_ACTION_DELAY:-0.12}" \
         || "$current_mode" != "${BOWXT_SYNC_MODE:-polling}" \
         || "$current_sender" != "${BOWXT_UIA_SENDER:-1}" \
-        || "$current_my_names" != "${BOWXT_MY_NAMES:-}" ]]; then
+        || "$current_my_names" != "${BOWXT_MY_NAMES:-}" \
+        || "$current_plugin" != "$plugin_host_dir" ]]; then
         echo "replacing container to apply image/display mode (login volume is preserved)"
         docker_run rm -f "$container_name" >/dev/null
       else
@@ -86,6 +97,10 @@ case "${1:-help}" in
     fi
     if ! docker_run inspect "$container_name" >/dev/null 2>&1; then
       docker_run volume create "$volume_name" >/dev/null
+      plugin_args=(--env BOWXT_AGENT_PLUGIN_DIRS=/opt/bowxt-agents:/home/wechat/.local/share/bowxt/plugins)
+      if [[ -n "$plugin_host_dir" ]]; then
+        plugin_args+=(--volume "$plugin_host_dir:/opt/bowxt-agents/kjfwd-bot:ro,z")
+      fi
       docker_run run -d \
         --name "$container_name" \
         --hostname "$container_name" \
@@ -108,6 +123,7 @@ case "${1:-help}" in
         --env BOWXT_SYNC_MODE="${BOWXT_SYNC_MODE:-polling}" \
         --env BOWXT_UIA_SENDER="${BOWXT_UIA_SENDER:-1}" \
         --env BOWXT_MY_NAMES="${BOWXT_MY_NAMES:-}" \
+        "${plugin_args[@]}" \
         --env TZ=Asia/Shanghai \
         --publish "127.0.0.1:${NOVNC_PORT:-6080}:6080" \
         --publish "127.0.0.1:${VNC_PORT:-5900}:5900" \
@@ -119,6 +135,11 @@ case "${1:-help}" in
     echo "bowxt: http://127.0.0.1:${WEB_PORT:-8787}/"
     echo "noVNC: http://127.0.0.1:${NOVNC_PORT:-6080}/vnc.html?autoconnect=1&resize=scale&reconnect=1&reconnect_delay=1000"
     echo "VNC scope: $vnc_scope"
+    if [[ -n "$plugin_host_dir" ]]; then
+      echo "Agent plugin: $plugin_host_dir"
+    else
+      echo "Agent plugin: none (set BOWXT_AGENT_PLUGIN_HOST_DIR to install one)"
+    fi
     ;;
   open)
     xdg-open "http://127.0.0.1:${WEB_PORT:-8787}/" >/dev/null 2>&1 &

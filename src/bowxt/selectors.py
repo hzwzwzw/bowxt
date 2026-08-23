@@ -23,6 +23,12 @@ class WeChatProfile:
 DEFAULT_PROFILE = WeChatProfile()
 
 
+@dataclass(frozen=True, slots=True)
+class ProfileIdentity:
+    name: str
+    organization: str | None = None
+
+
 def find_message_list(root: Node, profile: WeChatProfile = DEFAULT_PROFILE) -> Node | None:
     candidates: list[tuple[int, int, Node]] = []
     root_bounds = root.bounds
@@ -200,8 +206,8 @@ def is_profile_card(window: Node) -> bool:
     return len(found) >= 2
 
 
-def find_profile_name(profile_window: Node) -> str | None:
-    """Extract the primary nickname only from a verified profile card."""
+def find_profile_identity(profile_window: Node) -> ProfileIdentity | None:
+    """Extract nickname and enterprise organization from a verified card."""
 
     if not is_profile_card(profile_window):
         return None
@@ -229,7 +235,62 @@ def find_profile_name(profile_window: Node) -> str | None:
         score -= depth
         score -= max(0, bounds.y - root_bounds.y) // 8
         candidates.append((score, name))
-    return max(candidates, default=(0, None), key=lambda item: item[0])[1]
+    name = max(candidates, default=(0, None), key=lambda item: item[0])[1]
+    if not name:
+        return None
+
+    organization = _profile_value_for_label(profile_window, "企业")
+    if not organization:
+        # Enterprise WeChat contacts also expose a compact @organization
+        # label below the nickname. Use it only when the explicit 企业 row is
+        # absent; it is never allowed to replace the primary nickname.
+        top_limit = root_bounds.y + min(150, root_bounds.height * 0.38)
+        top_organizations: list[tuple[int, str]] = []
+        for node, depth in walk(profile_window, max_depth=12):
+            value = _display_clean(node.name)
+            bounds = node.bounds
+            if (
+                value.startswith("@")
+                and 1 < len(value) <= 65
+                and bounds is not None
+                and bounds.y <= top_limit
+            ):
+                top_organizations.append((bounds.y * 10 + depth, value[1:].strip()))
+        if top_organizations:
+            organization = min(top_organizations, key=lambda item: item[0])[1]
+    return ProfileIdentity(name=name, organization=organization or None)
+
+
+def find_profile_name(profile_window: Node) -> str | None:
+    """Extract the primary nickname only from a verified profile card."""
+
+    identity = find_profile_identity(profile_window)
+    return identity.name if identity else None
+
+
+def _profile_value_for_label(profile_window: Node, label: str) -> str | None:
+    keys = [
+        node
+        for node, _depth in walk(profile_window, max_depth=12)
+        if _display_clean(node.name) == label and node.bounds is not None
+    ]
+    candidates: list[tuple[int, int, str]] = []
+    for key in keys:
+        assert key.bounds is not None
+        for node, depth in walk(profile_window, max_depth=12):
+            value = _display_clean(node.name)
+            bounds = node.bounds
+            if (
+                not value
+                or value == label
+                or bounds is None
+                or node.role not in {"button", "label", "text"}
+                or bounds.x <= key.bounds.right
+                or abs(bounds.y - key.bounds.y) > max(4, key.bounds.height // 2)
+            ):
+                continue
+            candidates.append((abs(bounds.y - key.bounds.y), bounds.x + depth, value))
+    return min(candidates, default=(0, 0, None), key=lambda item: (item[0], item[1]))[2]
 
 
 def visible_message_nodes(message_list: Node) -> list[Node]:

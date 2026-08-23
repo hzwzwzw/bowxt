@@ -1,5 +1,7 @@
 # bowxt
 
+[![CI](https://github.com/hzwzwzw/bowxt/actions/workflows/ci.yml/badge.svg)](https://github.com/hzwzwzw/bowxt/actions/workflows/ci.yml)
+
 `bowxt`（wx + box + bot）是一个面向 Linux 的微信消息收发框架。它在 Docker 中运行官方
 Linux 微信，通过 AT-SPI 读取可见控件树，并用真实键鼠事件完成界面操作，同时提供 Web IM、
 HTTP API 和面向 Agent 的 Python 客户端。
@@ -13,8 +15,10 @@ HTTP API 和面向 Agent 的 Python 客户端。
 - 在“轮询 / 新消息唤醒 / 暂停”三种同步模式间切换；
 - 多会话持久化、消息去重、异步发送队列和发送状态跟踪；
 - Web IM 对话、会话添加、未读提示、历史翻页、图片显示和实时更新；
+- 不登录微信也可创建模拟联系人或群聊，构造文字、图片、发送人和时间并触发正常 Agent 事件；
 - 面向 Agent 的独立消费游标、批量领取、租约、ACK/NACK、崩溃重投和幂等发送；
 - 独立的 Agent 日志通道，支持持久化、实时跟随、级别过滤、搜索和复制。
+- Agent 可发布受限的声明式自定义面板，在 Web IM 中安全展示运行状态和业务层级数据。
 
 ## 快速开始
 
@@ -82,12 +86,15 @@ VNC_SCOPE=window
 
 ## Web IM
 
-Web IM 提供两个页面：
+Web IM 提供三个页面：
 
 - **对话**：点击左上角 `+` 添加联系人或群聊；支持会话切换、未读红点、历史消息翻页、图片、
   乐观发送气泡和异步发送状态。发送任务在后台串行操作微信，输入框不会等待上一条消息完成。
-- **Agent 日志**：显示 Agent 通过日志 API 写入的持久化日志，支持实时跟随、级别过滤、全文
-  搜索、复制和向前加载历史。日志与微信消息完全分开，不会生成聊天气泡或触发微信操作。
+- **Agent 管理**：从管理员安装的插件创建多个隔离实例，在 Web IM 中配置、启动、停止、重启，
+  并按实例查看日志。顶部只保留“对话”和“Agent”；日志从实例卡片弹窗打开。每个实例自动使用
+  自己的实例 ID 作为 durable consumer。
+- **会话权限**：每个 Agent 分别配置读、写范围，支持全部会话、指定会话、正则白名单和正则
+  黑名单。实例卡片展示策略允许范围，以及 consumer 最近一次实际领取的会话。
 
 左下角可以切换同步模式并调整轮询、键鼠间隔：
 
@@ -103,6 +110,21 @@ Web IM 提供两个页面：
 ./manage.sh add-chat 测试群 group
 ```
 
+### 模拟会话
+
+点击左上角 `+`，把“会话来源”改为“模拟调试会话”，即可创建模拟联系人或群聊。它使用与普通
+会话相同的消息列表、输入框、持久化和 Agent 投递协议，但不会打开微信窗口或执行键鼠操作，因此
+微信未登录时仍可使用。
+
+进入模拟会话后点击“模拟接收”，可以构造文字或图片消息。时间默认当前时间，也可手工指定；模拟
+群聊必须填写发送者，可选组织名；“视为 @ 当前微信账号”可用于测试 `mention_only` Agent。上传图片
+会在服务端验证并转换为清晰 PNG，再通过现有图片接口提供给 Agent。Agent 或 WebIM 在模拟会话中
+发送的回复会直接标记为本地已发送，不会进入微信发送队列。
+
+模拟消息进入与微信消息相同的 SQLite 消息流、SSE 更新和 Agent claim/lease/ACK 链路。暂停模式
+同样会拒绝模拟接收和回复。为避免 Agent 伪造入站事件，带 `X-Bowxt-Agent` 身份的请求不能创建
+模拟会话或调用模拟接收接口。
+
 ## Agent 开发
 
 Agent 应连接已经运行的 bowxt Web 服务，不要创建第二个直接操作微信的 UI 客户端。
@@ -117,7 +139,7 @@ def handle(delivery):
     message = delivery.message
     agent.log(
         "info",
-        f"收到 {message.sender}: {message.content}",
+        f"收到 {message.sender} ({message.sender_organization or '个人微信'}): {message.content}",
         event="message_received",
         context={"seq": message.seq},
     )
@@ -134,13 +156,70 @@ agent.run_forever(
 每个 `consumer` 拥有独立、持久化的消费进度。新 consumer 默认从当前消息末尾开始，避免 Agent
 上线后回复历史消息；需要导入历史时可在第一次 `claim()` 使用 `replay_existing=True`。领取的
 消息带租约，处理成功后 ACK，失败时 NACK；进程崩溃后租约到期会重新投递。
+群聊消息的 `sender` 是发送者昵称；企业微信联系人资料卡提供的“企业”另存为
+`sender_organization`，普通联系人则为 `None`。
 
 `send_text()`、`reply_text()` 和 `forward_text()` 都是异步、可幂等提交。`pending` 仅表示进入
 队列；最终状态可通过 `wait_delivery()` 或消息 API 查询。图片消息可使用 `download_image()`
 获取 bowxt 已保存的图片。
 
+受管 Agent 还可用 `publish_panel()` 在自己的实例卡片上添加只读自定义面板。前端只渲染 bowxt
+定义的树节点，不接受 Agent 提供的 HTML、脚本或样式：
+
+```python
+agent.publish_panel("status", "运行状态", [
+    {"label": "客户群", "meta": "2 个任务", "expanded": True, "children": [
+        {"label": "任务 task-17", "value": "等待模型回复", "tone": "info"},
+    ]},
+])
+```
+
 完整接口、投递语义和更多示例见 [AGENT_API.md](AGENT_API.md)，最小可运行示例见
 [examples/agent_echo.py](examples/agent_echo.py)。
+
+### 多 Agent 插件
+
+一个微信桌面窗口只能由 bowxt 的单个 UI worker 操作，但消息可以广播给多个 durable consumer：
+
+```text
+微信桌面窗口 -> bowxt UI worker -> SQLite 消息流
+                                  |- kjfwd-prod（客户群）
+                                  |- personal-secretary（私人联系人）
+                                  `- 其他 Agent 实例
+```
+
+Agent 插件是管理员预先安装的目录，其中包含 `bowxt-agent.json`。Web 前端不会接受任意命令或
+上传可执行代码，只允许从 `BOWXT_AGENT_PLUGIN_DIRS` 指定的受信任目录创建实例。示例 manifest：
+
+```json
+{
+  "schema_version": 1,
+  "id": "my-agent",
+  "name": "My Agent",
+  "version": "1.0.0",
+  "entrypoint": ["{python}", "{plugin_dir}/app.py", "--config", "{config_path}", "--env", "{env_path}"],
+  "default_config_file": "config.example.json",
+  "resources": ["prompts", "skills"],
+  "secret_schema": [{"name": "API_KEY", "label": "API Key", "required": true}]
+}
+```
+
+多个插件目录按 `BOWXT_AGENT_PLUGIN_DIRS` 中的顺序决定优先级；相同插件 ID 只采用最先发现的副本。
+这允许只读主机挂载覆盖 volume 中保留的 fallback 副本，而不会创建两个插件类型。
+
+可用占位符为 `{python}`、`{plugin_dir}`、`{instance_dir}`、`{config_path}`、`{env_path}`。
+bowxt 还会注入 `BOWXT_BASE_URL`、`BOWXT_AGENT_ID`、`BOWXT_CONSUMER` 和
+`BOWXT_AGENT_DATA_DIR`，并用 `BOWXT_MANAGED=1` 标记受管进程。插件应优先读取这些变量，使每个
+实例拥有唯一消费身份和独立数据目录。生产 Agent 推荐统一由该控制面运行；外部 `AgentClient`
+进程主要用于开发调试或控制面故障回退。
+
+配置与密钥保存在消息数据库同目录的实例区，并物化为权限 `0600` 的 `config.json` 和 `.env`。
+API 只返回密钥是否已配置，不会返回原值。插件退出、stdout/stderr 和生命周期事件统一写入该实例日志。
+
+不同 consumer 会各自收到符合插件 `chat_ids` 与控制面读权限交集的消息；相同 consumer 的多个
+进程是竞争消费。控制面还会在受管 Agent 发送消息时执行独立的写权限。因此多个 Agent 应使用
+不同实例 ID，并在 Web IM 中明确配置群聊或联系人范围。运行中的实例也可进入配置，保存时确认后
+由 bowxt 停止、写入配置并重启。
 
 ## HTTP API
 
@@ -150,9 +229,12 @@ agent.run_forever(
 GET    /api/status
 GET    /api/chats
 POST   /api/chats
+POST   /api/simulated-chats
 PATCH  /api/chats/{id}
 GET    /api/chats/{id}/messages
+GET    /api/chats/{id}/history?since={ISO-8601}&until={ISO-8601}
 POST   /api/chats/{id}/messages
+POST   /api/chats/{id}/simulate
 GET    /api/messages?after={seq}
 GET    /api/messages/{seq}
 GET    /api/messages/{seq}/image
@@ -164,6 +246,19 @@ POST   /api/agents/{consumer}/deliveries/{seq}/ack
 POST   /api/agents/{consumer}/deliveries/{seq}/nack
 GET    /api/agent/logs
 POST   /api/agent/logs
+GET    /api/agent/plugins
+GET    /api/agent/instances
+POST   /api/agent/instances
+GET    /api/agent/instances/{id}
+PATCH  /api/agent/instances/{id}
+DELETE /api/agent/instances/{id}
+POST   /api/agent/instances/{id}/start
+POST   /api/agent/instances/{id}/stop
+POST   /api/agent/instances/{id}/restart
+GET    /api/agent/instances/{id}/panels
+GET    /api/agent/instances/{id}/panels/{panel_id}
+PUT    /api/agent/panels/{panel_id}
+DELETE /api/agent/panels/{panel_id}
 ```
 
 Web/API 请求不会直接并发操作微信。所有读取、切换和发送都由一个 UI 工作线程执行，发送任务
@@ -199,6 +294,10 @@ PYTHONPATH=src:tests python3 -W error::ResourceWarning -m unittest discover -s t
 bash -n manage.sh scripts/*
 python3 -m compileall -q src tests
 ```
+
+GitHub Actions 会在 Python 3.10/3.12 上运行单元测试和资源泄漏检查，构建并重新安装发布 wheel，
+再构建完整微信桌面镜像。最后一个任务会启动未登录微信的新容器，通过模拟会话黑盒验证群发送人和
+组织、图片、Agent 租约/ACK、幂等发送及暂停/恢复链路，因此无需在 CI 中使用真实微信账号。
 
 实机验证记录见 [VALIDATION.md](VALIDATION.md)，开发约束见 [AGENT.md](AGENT.md)。
 

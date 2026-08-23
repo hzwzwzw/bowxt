@@ -4,14 +4,16 @@ import os
 import queue
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Iterable
 
 from .client import WeChatClient
 from .errors import ServicePaused
-from .models import ChatType, Direction, MessageType
+from .models import ChatType, Direction, Message, MessageImage, MessageType, SendReceipt
 from .store import AgentDelivery, AgentLog, SQLiteStore, StoredChat, StoredMessage
 
 
@@ -230,6 +232,66 @@ class BowxtService:
         self._wake.set()
         return chat
 
+    def add_simulated_chat(
+        self, name: str, chat_type: ChatType | str
+    ) -> StoredChat:
+        chat = self.store.create_simulated_chat(name, chat_type)
+        self.events.publish({"type": "chat", "chat": chat.as_dict()})
+        return chat
+
+    def inject_simulated_message(
+        self,
+        chat_id: int,
+        *,
+        text: str = "",
+        sender: str | None = None,
+        sender_organization: str | None = None,
+        timestamp: datetime | None = None,
+        is_at_me: bool = False,
+        image: MessageImage | None = None,
+    ) -> StoredMessage:
+        """Persist a fabricated incoming message and wake normal Agent consumers."""
+
+        if self._paused.is_set():
+            raise ServicePaused("bowxt UI worker is paused")
+        chat = self.store.get_chat(chat_id)
+        if chat.source != "simulation":
+            raise ValueError("messages can only be simulated inside a simulated chat")
+        clean_text = str(text or "").strip()
+        if image is None and not clean_text:
+            raise ValueError("simulated text must not be empty")
+        if len(clean_text) > 20_000:
+            raise ValueError("simulated text must not exceed 20000 characters")
+        clean_sender = " ".join(str(sender or "").split())
+        clean_organization = " ".join(str(sender_organization or "").split())
+        if chat.chat_type is ChatType.GROUP and not clean_sender:
+            raise ValueError("simulated group messages require a sender")
+        if len(clean_sender) > 128 or len(clean_organization) > 128:
+            raise ValueError("sender and organization must not exceed 128 characters")
+        if chat.chat_type is ChatType.CONTACT:
+            clean_sender = clean_sender or chat.name
+            clean_organization = ""
+        message_time = timestamp or datetime.now(timezone.utc)
+        if message_time.tzinfo is None or message_time.utcoffset() is None:
+            raise ValueError("simulated message timestamp must include a timezone")
+        message = Message(
+            id=f"simulation:{uuid.uuid4().hex}",
+            chat=chat.name,
+            content=clean_text or "[图片]",
+            type=MessageType.IMAGE if image is not None else MessageType.TEXT,
+            direction=Direction.INCOMING,
+            sender=clean_sender,
+            sender_organization=clean_organization or None,
+            timestamp=message_time.astimezone(timezone.utc),
+            chat_type=chat.chat_type,
+            is_at_me=bool(is_at_me),
+            image=image,
+            raw={"source": "simulation", "sender_source": "simulation"},
+        )
+        stored, _created = self.store.save_message(message)
+        self.events.publish({"type": "message", "message": stored.as_dict()})
+        return stored
+
     def update_chat_type(self, chat_id: int, chat_type: ChatType | str) -> StoredChat:
         chat = self.store.update_chat_type(chat_id, chat_type)
         self.events.publish({"type": "chat", "chat": chat.as_dict()})
@@ -247,6 +309,7 @@ class BowxtService:
         require_sender: bool = False,
         require_at_me: bool = False,
         replay_existing: bool = False,
+        deny_all_chats: bool = False,
     ) -> list[AgentDelivery]:
         """Long-poll the durable incoming-message stream for an Agent.
 
@@ -257,6 +320,7 @@ class BowxtService:
 
         if self._paused.is_set():
             raise ServicePaused("bowxt UI worker is paused")
+        selected_chat_ids = tuple(dict.fromkeys(int(item) for item in chat_ids))
         wait_seconds = min(max(float(timeout), 0.0), 25.0)
         deadline = time.monotonic() + wait_seconds
         subscriber = self.events.subscribe() if wait_seconds else None
@@ -266,12 +330,13 @@ class BowxtService:
                     raise ServicePaused("bowxt UI worker is paused")
                 deliveries = self.store.claim_agent_messages(
                     consumer,
-                    chat_ids=chat_ids,
+                    chat_ids=selected_chat_ids,
                     limit=limit,
                     lease_seconds=lease_seconds,
                     require_sender=require_sender,
                     require_at_me=require_at_me,
                     replay_existing=replay_existing,
+                    deny_all_chats=deny_all_chats,
                 )
                 if deliveries or subscriber is None:
                     return deliveries
@@ -335,7 +400,8 @@ class BowxtService:
         timeout: float = 30.0,
     ) -> StoredMessage:
         _pending, command = self._enqueue_text(chat_id, text, mentions=mentions)
-        assert command is not None
+        if command is None:
+            return _pending
         if not command.completed.wait(timeout):
             raise TimeoutError("timed out waiting for the WeChat UI worker")
         if command.error:
@@ -369,13 +435,32 @@ class BowxtService:
         mentions: Iterable[str] = (),
         client_id: str | None = None,
     ) -> tuple[StoredMessage, _SendCommand | None]:
-        if not self.is_running:
-            raise RuntimeError("bowxt UI worker is not running")
         if self._paused.is_set():
             raise ServicePaused("bowxt UI worker is paused")
         if not isinstance(text, str) or not text.strip():
             raise ValueError("text must not be empty")
         mention_names = tuple(mentions)
+        chat = self.store.get_chat(int(chat_id))
+        if chat.source == "simulation":
+            pending, created = self.store.queue_send(
+                int(chat_id), text, client_id=client_id, mentions=mention_names
+            )
+            if created:
+                pending = self.store.complete_pending_send(
+                    pending.seq,
+                    SendReceipt(
+                        chat=chat.name,
+                        content=text,
+                        sent_at=datetime.now(timezone.utc),
+                        verified=True,
+                        matched_message_id=pending.message_id,
+                        mentions=mention_names,
+                    ),
+                )
+                self.events.publish({"type": "message", "message": pending.as_dict()})
+            return pending, None
+        if not self.is_running:
+            raise RuntimeError("bowxt UI worker is not running")
         pending, created = self.store.queue_send(
             int(chat_id), text, client_id=client_id, mentions=mention_names
         )
@@ -494,7 +579,14 @@ class BowxtService:
 
                 # A stable ID order prevents new-message reordering in the UI
                 # from starving a quieter conversation.
-                chats = sorted(self.store.list_chats(enabled_only=True), key=lambda item: item.id)
+                chats = sorted(
+                    (
+                        item
+                        for item in self.store.list_chats(enabled_only=True)
+                        if item.source != "simulation"
+                    ),
+                    key=lambda item: item.id,
+                )
                 if (
                     mode is SyncMode.POLLING
                     and not self._paused.is_set()
@@ -529,7 +621,9 @@ class BowxtService:
         names = client.discover_unread_chats(limit=limit)
         processed = bool(names)
         for name in dict.fromkeys(names):
-            discovered = self.add_chat(name, ChatType.UNKNOWN, source="unread")
+            type_reader = getattr(client, "discovered_chat_type", None)
+            chat_type = type_reader(name) if type_reader is not None else ChatType.UNKNOWN
+            discovered = self.add_chat(name, chat_type, source="unread")
             self._poll_chat(client, discovered)
         return processed
 
@@ -688,14 +782,20 @@ class BowxtService:
             image_candidates = []
             backlog_candidate = None
             for message in messages:
+                if self.store.is_historical_quote_source(message):
+                    # Qt may expose an older source row after a quoted reply
+                    # is opened or the viewport is virtualized. The quote is
+                    # explicit evidence that this text predates the reply, so
+                    # it must not be appended as a new arrival.
+                    continue
                 stored, created = self.store.save_message(message)
                 sender_update = bool(
-                    message.sender is not None
+                    (message.sender is not None or message.sender_organization is not None)
                     and stored.seq not in self._sender_event_seqs
                 )
                 if created or sender_update:
                     self.events.publish({"type": "message", "message": stored.as_dict()})
-                if message.sender is not None:
+                if message.sender is not None or message.sender_organization is not None:
                     self._sender_event_seqs.add(stored.seq)
                     if len(self._sender_event_seqs) > 4096:
                         self._sender_event_seqs = set(sorted(self._sender_event_seqs)[-2048:])
@@ -714,8 +814,7 @@ class BowxtService:
                     uia_sender
                     and message.chat_type is ChatType.GROUP
                     and message.direction is Direction.INCOMING
-                    and message.sender is None
-                    and stored.sender is None
+                    and not self.store.sender_profile_checked(stored.seq)
                 ):
                     if created:
                         new_sender_candidates.append(message)

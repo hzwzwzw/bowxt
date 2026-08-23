@@ -3,23 +3,97 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: bowxt-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  test:
+  unit:
+    name: unit (Python ${{ matrix.python-version }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
+          cache: pip
       - name: Install package
-        run: python -m pip install --no-deps -e .
+        run: python -m pip install -e '.[vision]'
       - name: Unit tests
         run: PYTHONPATH=src:tests python -W error::ResourceWarning -m unittest discover -s tests -v
       - name: Shell syntax
         run: bash -n manage.sh scripts/*
       - name: Compile
         run: python -m compileall -q src tests
+
+  package:
+    name: package artifact
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install build
+      - run: python -m build
+      - name: Verify the wheel is self-contained
+        run: |
+          python -m venv /tmp/bowxt-wheel
+          /tmp/bowxt-wheel/bin/pip install dist/*.whl
+          /tmp/bowxt-wheel/bin/python - <<'PY'
+          from pathlib import Path
+          import bowxt
+          import bowxt.web
+
+          webui = Path(bowxt.web.__file__).with_name("webui")
+          assert (webui / "index.html").is_file()
+          assert (webui / "app.js").is_file()
+          assert bowxt.__version__
+          PY
+
+  container-e2e:
+    name: desktop image and simulated Agent chain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build reproducible desktop image
+        run: docker build --tag bowxt:ci .
+      - name: Run the full suite inside the image
+        run: >-
+          docker run --rm --entrypoint /bin/sh bowxt:ci -lc
+          'cd /opt/bowxt && PYTHONPATH=src:tests
+          /opt/bowxt-venv/bin/python -W error::ResourceWarning -m unittest discover -s tests -v'
+      - name: Start a fresh desktop without a WeChat login
+        run: docker run --detach --name bowxt-ci --shm-size 1g --publish 127.0.0.1:18787:8787 bowxt:ci
+      - name: Wait for WebIM and exercise the black-box simulation API
+        run: |
+          for attempt in $(seq 1 90); do
+            if curl --fail --silent http://127.0.0.1:18787/api/status >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 90 ]; then
+              docker logs bowxt-ci
+              exit 1
+            fi
+            sleep 2
+          done
+          python tests/ci_simulation_e2e.py http://127.0.0.1:18787
+      - name: Show service logs after a failure
+        if: failure()
+        run: docker logs --tail 300 bowxt-ci
+      - name: Stop test desktop
+        if: always()
+        run: docker rm --force bowxt-ci >/dev/null 2>&1 || true
