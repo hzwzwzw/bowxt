@@ -51,7 +51,7 @@ jobs:
       - name: Verify the wheel is self-contained
         run: |
           python -m venv /tmp/bowxt-wheel
-          /tmp/bowxt-wheel/bin/pip install dist/*.whl
+          /tmp/bowxt-wheel/bin/pip install Pillow dist/*.whl
           /tmp/bowxt-wheel/bin/python - <<'PY'
           from pathlib import Path
           import bowxt
